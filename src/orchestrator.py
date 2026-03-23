@@ -3,7 +3,7 @@ import json
 import shutil
 import importlib.util
 from data_connectors import GDriveConnector
-from loader_factory import get_loader
+from factory_loader import get_loader
 
 def load_user_task(task_path):
     spec = importlib.util.spec_from_file_location("user_task", task_path)
