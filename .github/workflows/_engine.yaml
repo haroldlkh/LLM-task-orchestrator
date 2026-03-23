@@ -9,9 +9,6 @@ on:
       source_folder_id:
         required: true
         type: string
-      owner_email:
-        required: true
-        type: string
       task_script:
         required: true
         type: string
@@ -22,48 +19,52 @@ on:
         default: "tabular"
         type: string
     secrets:
-      GDRIVE_KEY:
+      GDRIVE_CLIENT_ID:
+        required: true
+      GDRIVE_CLIENT_SECRET:
+        required: true
+      GDRIVE_REFRESH_TOKEN:
         required: true
 
 jobs:
   execute-engine:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Engine Code
         uses: actions/checkout@v4
         with:
           repository: haroldlkh/LLM-task-orchestrator
-          path: engine 
+          path: engine
 
       - name: Checkout User Task Code
         uses: actions/checkout@v4
         with:
-          path: user_repo 
+          path: user_repo
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python_version: '3.10'
-          cache: 'pip'
+          python-version: "3.10"
+          cache: "pip"
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r engine/requirements.txt 
+          pip install -r engine/requirements.txt
 
       - name: Run Orchestrator
         env:
-          GDRIVE_KEY: ${{ secrets.GDRIVE_KEY }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           OUTPUT_FOLDER_ID: ${{ inputs.output_folder_id }}
           SOURCE_FOLDER_ID: ${{ inputs.source_folder_id }}
-          OWNER_EMAIL: ${{ inputs.owner_email }}
-          TASK_SCRIPT: user_repo/${{ inputs.task_script }} 
+          TASK_SCRIPT: user_repo/${{ inputs.task_script }}
           BATCH_SIZE: ${{ inputs.batch_size }}
           DATA_TYPE: ${{ inputs.data_type }}
           WORKFLOW_NAME: ${{ github.workflow }}
-          RUN_ID: ${{ github.run_id }}
           PYTHONPATH: ${{ github.workspace }}/engine/src
         run: |
-          # Use 'export' so the variable is available to the python process immediately
           export TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
           python engine/src/orchestrator.py

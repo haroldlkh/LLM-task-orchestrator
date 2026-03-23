@@ -1,21 +1,40 @@
-import polars as pl
 import os
+import polars as pl
+
 
 class TabularDataLoader:
     def __init__(self, temp_dir):
         self.temp_dir = temp_dir
 
     def load(self, target_columns):
+        """
+        Loads parquet files from the temp directory as a LazyFrame.
+        If target_columns is empty, load all columns.
+        """
         search_path = os.path.join(self.temp_dir, "*.parquet")
-        return pl.scan_parquet(search_path).select(target_columns)
+        lf = pl.scan_parquet(search_path)
+
+        if target_columns:
+            lf = lf.select(target_columns)
+
+        return lf
 
     def save(self, data, base_name):
         """
-        Handles naming and writing for Tabular data.
-        Returns the final filename so the Orchestrator knows what to upload.
+        Saves either a Polars LazyFrame or DataFrame to parquet.
+        Returns the final filename.
         """
         filename = f"{base_name}.parquet"
+
+        if isinstance(data, pl.LazyFrame):
+            data.collect().write_parquet(filename)
+            return filename
+
         if isinstance(data, pl.DataFrame):
             data.write_parquet(filename)
             return filename
-        return None
+
+        raise TypeError(
+            f"Unsupported data type for save(): {type(data)}. "
+            f"Expected pl.LazyFrame or pl.DataFrame."
+        )
