@@ -18,6 +18,9 @@ on:
       data_type:
         default: "tabular"
         type: string
+      process_mode:
+        default: "batch"
+        type: string
     secrets:
       GDRIVE_CLIENT_ID:
         required: true
@@ -63,6 +66,7 @@ jobs:
           TASK_SCRIPT: user_repo/${{ inputs.task_script }}
           BATCH_SIZE: ${{ inputs.batch_size }}
           DATA_TYPE: ${{ inputs.data_type }}
+          PROCESS_MODE: ${{ inputs.process_mode }}
           WORKFLOW_NAME: ${{ github.workflow }}
           PYTHONPATH: ${{ github.workspace }}/engine/src
         run: |
