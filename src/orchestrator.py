@@ -16,6 +16,7 @@ def run_pipeline():
     creds = json.loads(os.environ['GDRIVE_KEY'])
     source_folder = os.environ['SOURCE_FOLDER_ID']
     output_folder = os.environ['OUTPUT_FOLDER_ID']
+    owner_email = os.environ.get('OWNER_EMAIL')
     
     # Metadata for naming
     wf_name = os.environ.get("WORKFLOW_NAME", "task").replace(" ", "_")
@@ -56,7 +57,7 @@ def run_pipeline():
             final_filename = loader.save(processed_data, base_name)
             
             if final_filename and os.path.exists(final_filename):
-                connector.upload_file(final_filename, output_folder, final_filename)
+                connector.upload_file(final_filename, output_folder, final_filename, owner_email)
                 print(f"Uploaded: {final_filename}")
                 os.remove(final_filename)
 

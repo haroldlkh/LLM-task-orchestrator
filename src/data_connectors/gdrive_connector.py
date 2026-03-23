@@ -25,19 +25,37 @@ class GDriveConnector:
             done = False
             while not done:
                 status, done = downloader.next_chunk()
-                  
-    def upload_file(self, local_path, folder_id, remote_name):
+
+    def upload_file(self, local_path, folder_id, remote_name, owner_email):
         file_metadata = {
             'name': remote_name,
             'parents': [folder_id]
         }
         media = MediaFileUpload(local_path, resumable=True)
         
-        # Adding supportsAllDrives=True helps with permission delegation
+        # 1. Create the file
         file = self.service.files().create(
             body=file_metadata,
             media_body=media,
             fields='id',
-            supportsAllDrives=True 
+            supportsAllDrives=True
         ).execute()
-        return file.get('id')
+        
+        file_id = file.get('id')
+
+        # 2. Transfer Ownership to bypass the 403 Quota error
+        permission = {
+            'type': 'user',
+            'role': 'owner',
+            'emailAddress': owner_email
+        }
+        
+        # transferOwnership=True is key for personal Drive accounts
+        self.service.permissions().create(
+            fileId=file_id,
+            body=permission,
+            transferOwnership=True,
+            supportsAllDrives=True
+        ).execute()
+
+        return file_id

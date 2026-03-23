@@ -55,6 +55,7 @@ jobs:
           GDRIVE_KEY: ${{ secrets.GDRIVE_KEY }}
           OUTPUT_FOLDER_ID: ${{ inputs.output_folder_id }}
           SOURCE_FOLDER_ID: ${{ inputs.source_folder_id }}
+          OWNER_EMAIL: ${{ inputs.owner_email }}
           TASK_SCRIPT: user_repo/${{ inputs.task_script }} 
           BATCH_SIZE: ${{ inputs.batch_size }}
           DATA_TYPE: ${{ inputs.data_type }}
