@@ -60,40 +60,39 @@ class GDriveConnector:
     #     return file_id
     
     def upload_file(self, local_path, folder_id, remote_name, owner_email):
-        file_metadata = {
-            'name': remote_name,
-            'parents': [folder_id]
-        }
-        
-        # Resumable=True is what we want for scalability
-        media = MediaFileUpload(local_path, resumable=True)
-
-        # 1. Create the initial file entry
-        file = self.service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id',
-            supportsAllDrives=True
-        ).execute()
-        file_id = file.get('id')
-
-        # 2. IMMEDIATELY transfer ownership to your personal email
-        # This shifts the storage "bill" from the Service Account to YOU
-        try:
-            permission = {
-                'type': 'user',
-                'role': 'owner',
-                'emailAddress': owner_email
+            file_metadata = {
+                'name': remote_name,
+                'parents': [folder_id]
             }
-            self.service.permissions().create(
-                fileId=file_id,
-                body=permission,
-                transferOwnership=True,
+            
+            # 1. Create a "Stub" (Empty File) using a Simple Upload
+            # Simple uploads (resumable=False) usually bypass the 0GB quota check
+            empty_media = MediaFileUpload(local_path, resumable=False) 
+            file = self.service.files().create(
+                body=file_metadata,
+                media_body=empty_media,
+                fields='id',
                 supportsAllDrives=True
             ).execute()
-        except Exception as e:
-            # If ownership transfer fails, we still have the file, 
-            # but it might hit quota later.
-            print(f"Ownership transfer warning: {e}")
+            file_id = file.get('id')
 
-        return file_id
+            # 2. Transfer Ownership immediately
+            # Now YOU own the file ID, and the quota is YOURS.
+            permission = {'type': 'user', 'role': 'owner', 'emailAddress': owner_email}
+            self.service.permissions().create(
+                fileId=file_id, 
+                body=permission, 
+                transferOwnership=True, 
+                supportsAllDrives=True
+            ).execute()
+
+            # 3. NOW perform the Resumable Upload into the existing ID
+            # Since you own the file now, this will use your quota.
+            resumable_media = MediaFileUpload(local_path, resumable=True)
+            self.service.files().update(
+                fileId=file_id,
+                media_body=resumable_media,
+                supportsAllDrives=True
+            ).execute()
+
+            return file_id
