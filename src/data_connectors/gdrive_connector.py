@@ -59,40 +59,62 @@ class GDriveConnector:
 
     #     return file_id
     
-    def upload_file(self, local_path, folder_id, remote_name, owner_email):
+    def upload_file(self, local_path, folder_id, remote_name, owner_email=None):
             file_metadata = {
                 'name': remote_name,
                 'parents': [folder_id]
             }
             
-            # 1. Create a "Stub" (Empty File) using a Simple Upload
-            # Simple uploads (resumable=False) usually bypass the 0GB quota check
-            empty_media = MediaFileUpload(local_path, resumable=False) 
+            # KEY CHANGE: resumable=False
+            # Simple upload mode doesn't check 'session' quota
+            media = MediaFileUpload(local_path, resumable=False)
+            
+            print(f"Attempting simple upload of {remote_name} to folder {folder_id}...")
+            
             file = self.service.files().create(
                 body=file_metadata,
-                media_body=empty_media,
+                media_body=media,
                 fields='id',
                 supportsAllDrives=True
             ).execute()
-            file_id = file.get('id')
+            
+            return file.get('id')
 
-            # 2. Transfer Ownership immediately
-            # Now YOU own the file ID, and the quota is YOURS.
-            permission = {'type': 'user', 'role': 'owner', 'emailAddress': owner_email}
-            self.service.permissions().create(
-                fileId=file_id, 
-                body=permission, 
-                transferOwnership=True, 
-                supportsAllDrives=True
-            ).execute()
+    #simple create, then reassign
+    # def upload_file(self, local_path, folder_id, remote_name, owner_email):
+    #         file_metadata = {
+    #             'name': remote_name,
+    #             'parents': [folder_id]
+    #         }
+            
+    #         # 1. Create a "Stub" (Empty File) using a Simple Upload
+    #         # Simple uploads (resumable=False) usually bypass the 0GB quota check
+    #         empty_media = MediaFileUpload(local_path, resumable=False) 
+    #         file = self.service.files().create(
+    #             body=file_metadata,
+    #             media_body=empty_media,
+    #             fields='id',
+    #             supportsAllDrives=True
+    #         ).execute()
+    #         file_id = file.get('id')
 
-            # 3. NOW perform the Resumable Upload into the existing ID
-            # Since you own the file now, this will use your quota.
-            resumable_media = MediaFileUpload(local_path, resumable=True)
-            self.service.files().update(
-                fileId=file_id,
-                media_body=resumable_media,
-                supportsAllDrives=True
-            ).execute()
+    #         # 2. Transfer Ownership immediately
+    #         # Now YOU own the file ID, and the quota is YOURS.
+    #         permission = {'type': 'user', 'role': 'owner', 'emailAddress': owner_email}
+    #         self.service.permissions().create(
+    #             fileId=file_id, 
+    #             body=permission, 
+    #             transferOwnership=True, 
+    #             supportsAllDrives=True
+    #         ).execute()
 
-            return file_id
+    #         # 3. NOW perform the Resumable Upload into the existing ID
+    #         # Since you own the file now, this will use your quota.
+    #         resumable_media = MediaFileUpload(local_path, resumable=True)
+    #         self.service.files().update(
+    #             fileId=file_id,
+    #             media_body=resumable_media,
+    #             supportsAllDrives=True
+    #         ).execute()
+
+    #         return file_id
