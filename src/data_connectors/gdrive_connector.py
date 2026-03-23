@@ -26,35 +26,74 @@ class GDriveConnector:
             while not done:
                 status, done = downloader.next_chunk()
 
+    # def upload_file(self, local_path, folder_id, remote_name, owner_email):
+    #     file_metadata = {
+    #         'name': remote_name,
+    #         'parents': [folder_id]
+    #     }
+    #     media = MediaFileUpload(local_path, resumable=True)
+        
+    #     # 1. Create the file (initially owned by Service Account)
+    #     file = self.service.files().create(
+    #         body=file_metadata,
+    #         media_body=media,
+    #         fields='id',
+    #         supportsAllDrives=True
+    #     ).execute()
+        
+    #     file_id = file.get('id')
+
+    #     # 2. Transfer Ownership to your personal email to use your quota
+    #     permission = {
+    #         'type': 'user',
+    #         'role': 'owner',
+    #         'emailAddress': owner_email
+    #     }
+        
+    #     self.service.permissions().create(
+    #         fileId=file_id,
+    #         body=permission,
+    #         transferOwnership=True,
+    #         supportsAllDrives=True
+    #     ).execute()
+
+    #     return file_id
+    
     def upload_file(self, local_path, folder_id, remote_name, owner_email):
         file_metadata = {
             'name': remote_name,
             'parents': [folder_id]
         }
-        media = MediaFileUpload(local_path, resumable=True)
         
-        # 1. Create the file (initially owned by Service Account)
+        # Resumable=True is what we want for scalability
+        media = MediaFileUpload(local_path, resumable=True)
+
+        # 1. Create the initial file entry
         file = self.service.files().create(
             body=file_metadata,
             media_body=media,
             fields='id',
             supportsAllDrives=True
         ).execute()
-        
         file_id = file.get('id')
 
-        # 2. Transfer Ownership to your personal email to use your quota
-        permission = {
-            'type': 'user',
-            'role': 'owner',
-            'emailAddress': owner_email
-        }
-        
-        self.service.permissions().create(
-            fileId=file_id,
-            body=permission,
-            transferOwnership=True,
-            supportsAllDrives=True
-        ).execute()
+        # 2. IMMEDIATELY transfer ownership to your personal email
+        # This shifts the storage "bill" from the Service Account to YOU
+        try:
+            permission = {
+                'type': 'user',
+                'role': 'owner',
+                'emailAddress': owner_email
+            }
+            self.service.permissions().create(
+                fileId=file_id,
+                body=permission,
+                transferOwnership=True,
+                supportsAllDrives=True
+            ).execute()
+        except Exception as e:
+            # If ownership transfer fails, we still have the file, 
+            # but it might hit quota later.
+            print(f"Ownership transfer warning: {e}")
 
         return file_id
