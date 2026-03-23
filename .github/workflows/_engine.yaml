@@ -48,7 +48,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requriements.txt 
+          pip install -r engine/requirements.txt 
 
       - name: Run Orchestrator
         env:
@@ -58,11 +58,10 @@ jobs:
           TASK_SCRIPT: user_repo/${{ inputs.task_script }} 
           BATCH_SIZE: ${{ inputs.batch_size }}
           DATA_TYPE: ${{ inputs.data_type }}
-          # NEW: Passing workflow metadata for naming
           WORKFLOW_NAME: ${{ github.workflow }}
           RUN_ID: ${{ github.run_id }}
           PYTHONPATH: ${{ github.workspace }}/engine/src
         run: |
-          # Generate a timestamp in the runner
-          echo "TIMESTAMP=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_ENV
+          # Use 'export' so the variable is available to the python process immediately
+          export TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
           python engine/src/orchestrator.py
