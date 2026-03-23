@@ -25,9 +25,19 @@ class GDriveConnector:
             done = False
             while not done:
                 status, done = downloader.next_chunk()
-
-    def upload_file(self, local_path, folder_id, filename):
-        file_metadata = {'name': filename, 'parents': [folder_id]}
+                  
+    def upload_file(self, local_path, folder_id, remote_name):
+        file_metadata = {
+            'name': remote_name,
+            'parents': [folder_id]
+        }
         media = MediaFileUpload(local_path, resumable=True)
-        file = self.service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        
+        # Adding supportsAllDrives=True helps with permission delegation
+        file = self.service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id',
+            supportsAllDrives=True 
+        ).execute()
         return file.get('id')
