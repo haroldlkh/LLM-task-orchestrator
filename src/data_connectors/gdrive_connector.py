@@ -33,7 +33,7 @@ class GDriveConnector:
         }
         media = MediaFileUpload(local_path, resumable=True)
         
-        # 1. Create the file
+        # 1. Create the file (initially owned by Service Account)
         file = self.service.files().create(
             body=file_metadata,
             media_body=media,
@@ -43,14 +43,13 @@ class GDriveConnector:
         
         file_id = file.get('id')
 
-        # 2. Transfer Ownership to bypass the 403 Quota error
+        # 2. Transfer Ownership to your personal email to use your quota
         permission = {
             'type': 'user',
             'role': 'owner',
             'emailAddress': owner_email
         }
         
-        # transferOwnership=True is key for personal Drive accounts
         self.service.permissions().create(
             fileId=file_id,
             body=permission,

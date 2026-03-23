@@ -3,12 +3,13 @@ name: Engine Logic
 on:
   workflow_call:
     inputs:
-      # The folder where the results will be saved
       output_folder_id:
         required: true
         type: string
-      # The folder where the raw parquet files live
       source_folder_id:
+        required: true
+        type: string
+      owner_email:
         required: true
         type: string
       task_script:
