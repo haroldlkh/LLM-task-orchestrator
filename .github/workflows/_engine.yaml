@@ -3,9 +3,11 @@ name: Engine Logic
 on:
   workflow_call:
     inputs:
-      gdrive_folder_id:
+      # The folder where the results will be saved
+      output_folder_id:
         required: true
         type: string
+      # The folder where the raw parquet files live
       source_folder_id:
         required: true
         type: string
@@ -15,7 +17,6 @@ on:
       batch_size:
         default: "5"
         type: string
-      # NEW: The toggle for data handling
       data_type:
         default: "tabular"
         type: string
@@ -29,9 +30,14 @@ jobs:
     steps:
       - name: Checkout Engine Code
         uses: actions/checkout@v4
-        # This ensures we are running YOUR engine code, not the user's
         with:
           repository: haroldlkh/LLM-task-orchestrator
+          path: engine 
+
+      - name: Checkout User Task Code
+        uses: actions/checkout@v4
+        with:
+          path: user_repo 
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -40,12 +46,23 @@ jobs:
           cache: 'pip'
 
       - name: Install Dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r engine/requriements.txt 
 
       - name: Run Orchestrator
         env:
-          # We map the secrets/inputs to Environment Variables for Python
           GDRIVE_KEY: ${{ secrets.GDRIVE_KEY }}
-          GDRIVE_FOLDER_ID: ${{ inputs.gdrive_folder_id }}
-          SOURCE_FILE_ID: ${{ inputs.source_file_id }}
-        run: python src/orchestrator.py
+          OUTPUT_FOLDER_ID: ${{ inputs.output_folder_id }}
+          SOURCE_FOLDER_ID: ${{ inputs.source_folder_id }}
+          TASK_SCRIPT: user_repo/${{ inputs.task_script }} 
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          DATA_TYPE: ${{ inputs.data_type }}
+          # NEW: Passing workflow metadata for naming
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_ID: ${{ github.run_id }}
+          PYTHONPATH: ${{ github.workspace }}/engine/src
+        run: |
+          # Generate a timestamp in the runner
+          echo "TIMESTAMP=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_ENV
+          python engine/src/orchestrator.py
