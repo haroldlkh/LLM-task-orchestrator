@@ -1,55 +1,84 @@
 import os
 import json
 import shutil
-import polars as pl
+import importlib.util
 from data_connectors import GDriveConnector
+from loader_factory import get_loader
+
+def load_user_task(task_path):
+    """Dynamically imports the user's Python script from their repo."""
+    spec = importlib.util.spec_from_file_location("user_task", task_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 def run_pipeline():
-    # 1. Environment Setup (Passed from User Repo)
+    # 1. SETUP (Constants from Environment)
     creds = json.loads(os.environ['GDRIVE_KEY'])
     source_folder = os.environ['SOURCE_FOLDER_ID']
     output_folder = os.environ['GDRIVE_FOLDER_ID']
     
-    # Default batch size is 5, but can be overridden by the user
     batch_size = int(os.environ.get('BATCH_SIZE', 5))
+    task_script = os.environ.get("TASK_SCRIPT", "tasks/process.py")
+    data_type = os.environ.get("DATA_TYPE", "tabular")
     
+    # 2. INITIALIZE ENGINES
     connector = GDriveConnector(creds)
+    user_module = load_user_task(task_script)
     
-    # 2. Get the list of chunks
-    all_files = connector.list_files_in_folder(source_folder)
-    parquet_files = [f for f in all_files if f['name'].endswith('.parquet')]
-    print(f"Found {len(parquet_files)} parquet chunks.")
+    # 3. GET THE "CONTRACT"
+    # Ask the user task: What do you need from the data?
+    requirements = user_module.get_requirements()
+    target_cols = requirements.get('columns', [])
 
-    # 3. Sliding Window Loop
-    for i in range(0, len(parquet_files), batch_size):
-        batch = parquet_files[i : i + batch_size]
-        temp_dir = "temp_batch_data"
+    # 4. DISCOVER FILES IN GDRIVE
+    all_files = [
+        f for f in connector.list_files_in_folder(source_folder) 
+        if f['name'].endswith('.parquet') # Note: Discovery is still based on source file extension
+    ]
+    print(f"Found {len(all_files)} files. Starting processing in batches of {batch_size}...")
+
+    # 5. THE BATCHED LOOP
+    for i in range(0, len(all_files), batch_size):
+        batch = all_files[i : i + batch_size]
+        temp_dir = "temp_batch"
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Download Batch
-        print(f"--- Processing Batch {i//batch_size + 1} ---")
+        print(f"--- Processing Batch {i//batch_size + 1} ({len(batch)} files) ---")
+        
+        # Download the current batch
         for f_info in batch:
-            local_path = os.path.join(temp_dir, f_info['name'])
-            connector.download_file(f_info['id'], local_path)
+            dest = os.path.join(temp_dir, f_info['name'])
+            connector.download_file(f_info['id'], dest)
         
-        # 4. Lazy Load the whole batch at once
-        # This is where the magic happens: Polars treats the folder as one table
-        lf = pl.scan_parquet(f"{temp_dir}/*.parquet")
+        # --- THE ABSTRACTION LAYER ---
+        # Orchestrator asks for a loader, then tells it to load.
+        loader = get_loader(data_type, temp_dir)
+        data = loader.load(target_cols)
         
-        # TEST: Just counting rows to prove connection
-        df_result = lf.select(pl.len()).collect()
-        total_rows = df_result.item()
+        # 6. HAND OFF TO USER TASK
+        processed_data = user_module.run(data)
         
-        # 5. Upload a "Batch Receipt"
-        receipt_name = f"receipt_batch_{i//batch_size + 1}.txt"
-        with open(receipt_name, "w") as r:
-            r.write(f"Processed {len(batch)} files. Total rows in this batch: {total_rows}")
-        
-        connector.upload_file(receipt_name, output_folder, receipt_name)
-        
-        # 6. Cleanup local disk for next batch
+        # 7. SAVE & UPLOAD (Agnostic Version)
+        if processed_data is not None:
+            # We define the filename; the Loader handles the writing logic.
+            # In a tabular world, this saves as a .parquet file.
+            file_ext = "parquet" if data_type == "tabular" else "dat"
+            out_name = f"results_batch_{i//batch_size + 1}.{file_ext}"
+            
+            # The Loader handles the disk-writing (Specific to the data type)
+            save_success = loader.save(processed_data, out_name)
+            
+            if save_success:
+                # The Connector handles the upload (It just sees 'bytes')
+                connector.upload_file(out_name, output_folder, out_name)
+                print(f"Successfully uploaded {out_name}")
+                os.remove(out_name)
+
+        # 8. CLEANUP
         shutil.rmtree(temp_dir)
-        os.remove(receipt_name)
+
+    print("Pipeline complete.")
 
 if __name__ == "__main__":
     run_pipeline()

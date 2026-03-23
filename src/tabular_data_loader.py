@@ -1,8 +1,20 @@
 import polars as pl
+import os
 
 class TabularDataLoader:
-    def __init__(self, file_path):
-        self.file_path = file_path
+    def __init__(self, temp_dir):
+        self.temp_dir = temp_dir
 
-    def stream_data(self, target_columns):
-        return pl.scan_parquet(self.file_path).select(target_columns).collect().to_dicts()
+    def load(self, target_columns):
+        search_path = os.path.join(self.temp_dir, "*.parquet")
+        return pl.scan_parquet(search_path).select(target_columns)
+
+    def save(self, data, filename):
+        """
+        The Orchestrator calls this. 
+        Only the Loader knows that 'Tabular' data saves as Parquet.
+        """
+        if isinstance(data, pl.DataFrame):
+            data.write_parquet(filename)
+            return True
+        return False

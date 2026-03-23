@@ -1,16 +1,24 @@
-name: _Engine_Logic
+name: Engine Logic
 
 on:
   workflow_call:
-    # 1. These are "Public" inputs the user sends
     inputs:
       gdrive_folder_id:
         required: true
         type: string
-      source_file_id:
+      source_folder_id:
         required: true
         type: string
-    # 2. This is the "Private" secret the user sends
+      task_script:
+        required: true
+        type: string
+      batch_size:
+        default: "5"
+        type: string
+      # NEW: The toggle for data handling
+      data_type:
+        default: "tabular"
+        type: string
     secrets:
       GDRIVE_KEY:
         required: true
@@ -23,7 +31,7 @@ jobs:
         uses: actions/checkout@v4
         # This ensures we are running YOUR engine code, not the user's
         with:
-          repository: your-github-username/LLM-TASK-ORCHESTRATOR
+          repository: haroldlkh/LLM-task-orchestrator
 
       - name: Setup Python
         uses: actions/setup-python@v5
