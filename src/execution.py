@@ -2,7 +2,7 @@ import os
 import shutil
 from typing import Any, Dict, List
 
-from factory_loader import get_loader
+from loader_factory import get_loader
 
 
 def run_pipeline_steps(steps: List[Dict[str, Any]], data):
