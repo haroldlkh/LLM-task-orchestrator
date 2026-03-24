@@ -10,7 +10,16 @@ on:
         required: true
         type: string
       task_script:
-        required: true
+        required: false
+        default: ""
+        type: string
+      task_scripts:
+        required: false
+        default: ""
+        type: string
+      pipeline_name:
+        required: false
+        default: ""
         type: string
       batch_size:
         default: "5"
@@ -42,7 +51,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
           cache: "pip"
 
       - name: Install Dependencies
@@ -58,8 +67,13 @@ jobs:
           OUTPUT_FOLDER_ID: ${{ inputs.output_folder_id }}
           SOURCE_FOLDER_ID: ${{ inputs.source_folder_id }}
           TASK_SCRIPT: user_repo/${{ inputs.task_script }}
+          TASK_SCRIPTS: ${{ inputs.task_scripts }}
+          PIPELINE_NAME: ${{ inputs.pipeline_name }}
           BATCH_SIZE: ${{ inputs.batch_size }}
           PYTHONPATH: ${{ github.workspace }}/engine/src
         run: |
+          if [ -n "${TASK_SCRIPTS}" ]; then
+            export TASK_SCRIPTS=$(echo "${TASK_SCRIPTS}" | sed 's|^|user_repo/|' | sed 's|,|,user_repo/|g')
+          fi
           export TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
           python engine/src/orchestrator.py
