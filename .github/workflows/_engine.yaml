@@ -3,10 +3,16 @@ name: Engine Logic
 on:
   workflow_call:
     inputs:
-      output_folder_id:
+      source_connector:
         required: true
         type: string
-      source_folder_id:
+      source_location:
+        required: true
+        type: string
+      dest_connector:
+        required: true
+        type: string
+      dest_location:
         required: true
         type: string
       task_script:
@@ -25,12 +31,10 @@ on:
         default: "5"
         type: string
     secrets:
-      GDRIVE_CLIENT_ID:
-        required: true
-      GDRIVE_CLIENT_SECRET:
-        required: true
-      GDRIVE_REFRESH_TOKEN:
-        required: true
+      SOURCE_CONNECTOR_CONFIG_JSON:
+        required: false
+      DEST_CONNECTOR_CONFIG_JSON:
+        required: false
 
 jobs:
   execute-engine:
@@ -73,11 +77,12 @@ jobs:
 
       - name: Run Orchestrator
         env:
-          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
-          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
-          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
-          OUTPUT_FOLDER_ID: ${{ inputs.output_folder_id }}
-          SOURCE_FOLDER_ID: ${{ inputs.source_folder_id }}
+          SOURCE_CONNECTOR: ${{ inputs.source_connector }}
+          SOURCE_LOCATION: ${{ inputs.source_location }}
+          DEST_CONNECTOR: ${{ inputs.dest_connector }}
+          DEST_LOCATION: ${{ inputs.dest_location }}
+          SOURCE_CONNECTOR_CONFIG_JSON: ${{ secrets.SOURCE_CONNECTOR_CONFIG_JSON }}
+          DEST_CONNECTOR_CONFIG_JSON: ${{ secrets.DEST_CONNECTOR_CONFIG_JSON }}
           TASK_SCRIPT: ${{ inputs.task_script }}
           PIPELINE_SCRIPT: ${{ inputs.pipeline_script }}
           PIPELINE_NAME: ${{ inputs.pipeline_name }}

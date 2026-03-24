@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import shutil
@@ -5,7 +6,7 @@ import importlib.util
 import importlib
 from typing import Any, Dict, List
 
-from data_connectors import GDriveConnector
+from data_connectors import get_connector
 from factory_loader import get_loader
 
 
@@ -16,11 +17,26 @@ def require_env(name: str, allow_empty: bool = False) -> str:
     return value.strip()
 
 
+def parse_json_env(name: str, allow_empty: bool = True) -> dict:
+    raw = os.environ.get(name, "").strip()
+
+    if not raw:
+        if allow_empty:
+            return {}
+        raise ValueError(f"Required JSON environment variable {name} is missing or empty.")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{name} is not valid JSON: {e}") from e
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must decode to a JSON object/dict.")
+
+    return parsed
+
+
 def add_user_repo_to_path(path_in_repo: str) -> str:
-    """
-    Given a user_repo-relative file path, ensure user_repo root is on sys.path.
-    Returns absolute repo-root path.
-    """
     abs_path = os.path.abspath(path_in_repo)
     repo_root = abs_path.split(os.sep + "user_repo" + os.sep)[0] + os.sep + "user_repo"
     if repo_root not in sys.path:
@@ -58,10 +74,8 @@ def parse_entry_inputs() -> Dict[str, str]:
 def validate_task_module(user_module, task_script: str):
     if not hasattr(user_module, "TASK_CONFIG"):
         raise AttributeError(f"{task_script} must define TASK_CONFIG")
-
     if not hasattr(user_module, "get_requirements"):
         raise AttributeError(f"{task_script} must define get_requirements()")
-
     if not hasattr(user_module, "run"):
         raise AttributeError(f"{task_script} must define run(data)")
 
@@ -190,24 +204,25 @@ def run_single_task_runner(runner, data):
     return result
 
 
-def save_final_output(loader, data, output_folder, connector, output_name):
+def save_final_output(loader, data, dest_location, dest_connector, output_name):
     final_filename = loader.save(data, output_name)
 
     if final_filename and os.path.exists(final_filename):
         remote_name = os.path.basename(final_filename)
-        file_id = connector.upload_file(final_filename, output_folder, remote_name)
-        print(f"Uploaded: {remote_name} (file_id={file_id})")
+        object_id = dest_connector.upload_object(final_filename, dest_location, remote_name)
+        print(f"Uploaded: {remote_name} (object_id={object_id})")
         os.remove(final_filename)
     else:
         raise RuntimeError("No output file was created.")
 
 
 def run_global_execution(
-    connector,
+    source_connector,
+    dest_connector,
     loader,
     executable,
-    source_folder,
-    output_folder,
+    source_location,
+    dest_location,
     output_name,
     target_cols,
 ):
@@ -216,16 +231,16 @@ def run_global_execution(
 
     try:
         all_files = [
-            f for f in connector.list_files_in_folder(source_folder)
+            f for f in source_connector.list_objects(source_location)
             if f["name"].endswith(".parquet")
         ]
 
-        print(f"Discovered {len(all_files)} parquet file(s) in source folder.")
+        print(f"Discovered {len(all_files)} parquet file(s) in source location.")
 
         for f_info in all_files:
             local_path = os.path.join(temp_dir, f_info["name"])
             print(f"Downloading {f_info['name']}...")
-            connector.download_file(f_info["id"], local_path)
+            source_connector.download_object(f_info["id"], local_path)
 
         data = loader.load(target_cols)
 
@@ -234,28 +249,29 @@ def run_global_execution(
         else:
             result = run_pipeline_steps(executable["steps"], data)
 
-        save_final_output(loader, result, output_folder, connector, output_name)
+        save_final_output(loader, result, dest_location, dest_connector, output_name)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def run_batched_execution(
-    connector,
+    source_connector,
+    dest_connector,
     executable,
-    source_folder,
-    output_folder,
+    source_location,
+    dest_location,
     output_name,
     batch_size,
     data_type,
     target_cols,
 ):
     all_files = [
-        f for f in connector.list_files_in_folder(source_folder)
+        f for f in source_connector.list_objects(source_location)
         if f["name"].endswith(".parquet")
     ]
 
-    print(f"Discovered {len(all_files)} parquet file(s) in source folder.")
+    print(f"Discovered {len(all_files)} parquet file(s) in source location.")
 
     for i in range(0, len(all_files), batch_size):
         batch = all_files[i:i + batch_size]
@@ -269,7 +285,7 @@ def run_batched_execution(
             for f_info in batch:
                 local_path = os.path.join(temp_dir, f_info["name"])
                 print(f"Downloading {f_info['name']}...")
-                connector.download_file(f_info["id"], local_path)
+                source_connector.download_object(f_info["id"], local_path)
 
             loader = get_loader(data_type, temp_dir)
             data = loader.load(target_cols)
@@ -280,15 +296,21 @@ def run_batched_execution(
                 result = run_pipeline_steps(executable["steps"], data)
 
             batch_output_name = f"{output_name}_batch_{batch_num}"
-            save_final_output(loader, result, output_folder, connector, batch_output_name)
+            save_final_output(loader, result, dest_location, dest_connector, batch_output_name)
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def run_pipeline():
-    source_folder = require_env("SOURCE_FOLDER_ID")
-    output_folder = require_env("OUTPUT_FOLDER_ID")
+    source_connector_name = require_env("SOURCE_CONNECTOR")
+    source_location = require_env("SOURCE_LOCATION")
+    dest_connector_name = require_env("DEST_CONNECTOR")
+    dest_location = require_env("DEST_LOCATION")
+
+    source_connector_config = parse_json_env("SOURCE_CONNECTOR_CONFIG_JSON", allow_empty=True)
+    dest_connector_config = parse_json_env("DEST_CONNECTOR_CONFIG_JSON", allow_empty=True)
+
     ts = os.environ.get("TIMESTAMP", "000000")
     batch_size = int(os.environ.get("BATCH_SIZE", 5))
 
@@ -299,7 +321,8 @@ def run_pipeline():
     else:
         executable = load_pipeline(entry["path"])
 
-    connector = GDriveConnector()
+    source_connector = get_connector(source_connector_name, source_connector_config)
+    dest_connector = get_connector(dest_connector_name, dest_connector_config)
 
     mode = executable["mode"]
     data_type = executable["data_type"]
@@ -314,27 +337,31 @@ def run_pipeline():
     print(f"Entry path: {entry['path']}")
     print(f"Mode: {mode}")
     print(f"Data type: {data_type}")
-    print(f"Source folder: {source_folder}")
-    print(f"Output folder: {output_folder}")
+    print(f"Source connector: {source_connector_name}")
+    print(f"Source location: {source_location}")
+    print(f"Dest connector: {dest_connector_name}")
+    print(f"Dest location: {dest_location}")
     print(f"Output name base: {output_name}")
 
     if mode == "global":
         loader = get_loader(data_type, "temp_all")
         run_global_execution(
-            connector=connector,
+            source_connector=source_connector,
+            dest_connector=dest_connector,
             loader=loader,
             executable=executable,
-            source_folder=source_folder,
-            output_folder=output_folder,
-            output_name=f"{output_name}",
+            source_location=source_location,
+            dest_location=dest_location,
+            output_name=f"{output_name}_full",
             target_cols=target_cols,
         )
     elif mode == "batch":
         run_batched_execution(
-            connector=connector,
+            source_connector=source_connector,
+            dest_connector=dest_connector,
             executable=executable,
-            source_folder=source_folder,
-            output_folder=output_folder,
+            source_location=source_location,
+            dest_location=dest_location,
             output_name=output_name,
             batch_size=batch_size,
             data_type=data_type,
