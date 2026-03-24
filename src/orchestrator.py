@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import importlib.util
 from data_connectors import GDriveConnector
@@ -6,6 +7,10 @@ from factory_loader import get_loader
 
 
 def load_user_task(task_path):
+    repo_root = os.path.dirname(os.path.dirname(task_path))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     spec = importlib.util.spec_from_file_location("user_task", task_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load task script: {task_path}")
