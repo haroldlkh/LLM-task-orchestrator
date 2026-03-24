@@ -326,7 +326,7 @@ def run_pipeline():
             executable=executable,
             source_folder=source_folder,
             output_folder=output_folder,
-            output_name=f"{output_name}_full",
+            output_name=f"{output_name}",
             target_cols=target_cols,
         )
     elif mode == "batch":
