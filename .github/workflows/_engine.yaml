@@ -13,7 +13,7 @@ on:
         required: false
         default: ""
         type: string
-      task_scripts:
+      pipeline_script:
         required: false
         default: ""
         type: string
@@ -48,15 +48,15 @@ jobs:
         with:
           path: user_repo
 
-      - name: Validate task inputs
+      - name: Validate entry inputs
         run: |
-          if [ -n "${{ inputs.task_script }}" ] && [ -n "${{ inputs.task_scripts }}" ]; then
-            echo "Provide either task_script or task_scripts, not both."
+          if [ -n "${{ inputs.task_script }}" ] && [ -n "${{ inputs.pipeline_script }}" ]; then
+            echo "Provide either task_script or pipeline_script, not both."
             exit 1
           fi
 
-          if [ -z "${{ inputs.task_script }}" ] && [ -z "${{ inputs.task_scripts }}" ]; then
-            echo "You must provide one of: task_script or task_scripts."
+          if [ -z "${{ inputs.task_script }}" ] && [ -z "${{ inputs.pipeline_script }}" ]; then
+            echo "You must provide one of: task_script or pipeline_script."
             exit 1
           fi
 
@@ -79,7 +79,7 @@ jobs:
           OUTPUT_FOLDER_ID: ${{ inputs.output_folder_id }}
           SOURCE_FOLDER_ID: ${{ inputs.source_folder_id }}
           TASK_SCRIPT: ${{ inputs.task_script }}
-          TASK_SCRIPTS: ${{ inputs.task_scripts }}
+          PIPELINE_SCRIPT: ${{ inputs.pipeline_script }}
           PIPELINE_NAME: ${{ inputs.pipeline_name }}
           BATCH_SIZE: ${{ inputs.batch_size }}
           PYTHONPATH: ${{ github.workspace }}/engine/src
@@ -88,8 +88,8 @@ jobs:
             export TASK_SCRIPT="user_repo/${TASK_SCRIPT}"
           fi
 
-          if [ -n "${TASK_SCRIPTS}" ]; then
-            export TASK_SCRIPTS=$(echo "${TASK_SCRIPTS}" | sed 's|^|user_repo/|' | sed 's|,|,user_repo/|g')
+          if [ -n "${PIPELINE_SCRIPT}" ]; then
+            export PIPELINE_SCRIPT="user_repo/${PIPELINE_SCRIPT}"
           fi
 
           export TIMESTAMP=$(date +'%Y%m%d_%H%M%S')

@@ -2,7 +2,8 @@ import os
 import sys
 import shutil
 import importlib.util
-from typing import List
+import importlib
+from typing import Any, Dict, List
 
 from data_connectors import GDriveConnector
 from factory_loader import get_loader
@@ -15,22 +16,43 @@ def require_env(name: str, allow_empty: bool = False) -> str:
     return value.strip()
 
 
-def load_user_task(task_path: str):
+def add_user_repo_to_path(path_in_repo: str) -> str:
     """
-    Load a task module from the user repo and make the user_repo root importable,
-    so imports like `from tasks.lib...` work.
+    Given a user_repo-relative file path, ensure user_repo root is on sys.path.
+    Returns absolute repo-root path.
     """
-    repo_root = os.path.dirname(os.path.dirname(task_path))
+    abs_path = os.path.abspath(path_in_repo)
+    repo_root = abs_path.split(os.sep + "user_repo" + os.sep)[0] + os.sep + "user_repo"
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
+    return repo_root
 
-    spec = importlib.util.spec_from_file_location("user_task", task_path)
+
+def load_python_file_module(file_path: str, module_name: str):
+    add_user_repo_to_path(file_path)
+
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load task script: {task_path}")
+        raise ImportError(f"Could not load Python file: {file_path}")
 
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def parse_entry_inputs() -> Dict[str, str]:
+    task_script = os.environ.get("TASK_SCRIPT", "").strip()
+    pipeline_script = os.environ.get("PIPELINE_SCRIPT", "").strip()
+
+    provided = [x for x in [task_script, pipeline_script] if x]
+    if len(provided) == 0:
+        raise ValueError("You must provide exactly one of TASK_SCRIPT or PIPELINE_SCRIPT.")
+    if len(provided) > 1:
+        raise ValueError("Provide only one of TASK_SCRIPT or PIPELINE_SCRIPT, not both.")
+
+    if task_script:
+        return {"entry_type": "task", "path": task_script}
+    return {"entry_type": "pipeline", "path": pipeline_script}
 
 
 def validate_task_module(user_module, task_script: str):
@@ -57,79 +79,115 @@ def validate_task_module(user_module, task_script: str):
     return task_config
 
 
-def parse_task_paths() -> List[str]:
-    """
-    Backward compatible:
-    - TASK_SCRIPT = one task
-    - TASK_SCRIPTS = comma-separated task list
-    """
-    task_script = os.environ.get("TASK_SCRIPT", "").strip()
-    task_scripts = os.environ.get("TASK_SCRIPTS", "").strip()
+def load_single_task(task_path: str) -> Dict[str, Any]:
+    module = load_python_file_module(task_path, "user_task")
+    config = validate_task_module(module, task_path)
 
-    if task_script and task_scripts:
-        raise ValueError("Use either TASK_SCRIPT or TASK_SCRIPTS, not both.")
-
-    if task_script:
-        return [task_script]
-
-    if task_scripts:
-        paths = [p.strip() for p in task_scripts.split(",") if p.strip()]
-        if not paths:
-            raise ValueError("TASK_SCRIPTS was provided but no valid paths were found.")
-        return paths
-
-    raise ValueError("You must provide TASK_SCRIPT or TASK_SCRIPTS.")
+    return {
+        "kind": "task",
+        "name": config["name"],
+        "mode": config["mode"],
+        "data_type": config["data_type"],
+        "requirements": module.get_requirements(),
+        "runner": module.run,
+    }
 
 
-def load_pipeline(task_paths: List[str]):
-    tasks = []
+def validate_pipeline_config(pipeline_module, pipeline_path: str):
+    if not hasattr(pipeline_module, "PIPELINE_CONFIG"):
+        raise AttributeError(f"{pipeline_path} must define PIPELINE_CONFIG")
 
-    for task_path in task_paths:
-        module = load_user_task(task_path)
-        config = validate_task_module(module, task_path)
-        tasks.append(
+    config = pipeline_module.PIPELINE_CONFIG
+
+    for key in ("name", "mode", "data_type", "requirements", "steps"):
+        if key not in config:
+            raise KeyError(f"{pipeline_path} PIPELINE_CONFIG must include '{key}'")
+
+    if config["mode"] not in {"batch", "global"}:
+        raise ValueError(
+            f"{pipeline_path} PIPELINE_CONFIG['mode'] must be 'batch' or 'global'"
+        )
+
+    requirements = config["requirements"]
+    if not isinstance(requirements, dict) or "columns" not in requirements:
+        raise ValueError(
+            f"{pipeline_path} PIPELINE_CONFIG['requirements'] must be a dict "
+            f"containing a 'columns' list"
+        )
+
+    if not isinstance(config["steps"], list) or not config["steps"]:
+        raise ValueError(f"{pipeline_path} PIPELINE_CONFIG['steps'] must be a non-empty list")
+
+    for i, step in enumerate(config["steps"], start=1):
+        if "module" not in step or "function" not in step:
+            raise KeyError(
+                f"{pipeline_path} step {i} must include 'module' and 'function'"
+            )
+
+    return config
+
+
+def load_pipeline(pipeline_path: str) -> Dict[str, Any]:
+    pipeline_module = load_python_file_module(pipeline_path, "user_pipeline")
+    config = validate_pipeline_config(pipeline_module, pipeline_path)
+
+    add_user_repo_to_path(pipeline_path)
+
+    loaded_steps = []
+    for step in config["steps"]:
+        module = importlib.import_module(step["module"])
+        function_name = step["function"]
+
+        if not hasattr(module, function_name):
+            raise AttributeError(
+                f"Pipeline step module '{step['module']}' does not have "
+                f"function '{function_name}'"
+            )
+
+        fn = getattr(module, function_name)
+        kwargs = step.get("kwargs", {})
+
+        loaded_steps.append(
             {
-                "path": task_path,
-                "module": module,
-                "config": config,
+                "module": step["module"],
+                "function": function_name,
+                "callable": fn,
+                "kwargs": kwargs,
             }
         )
 
-    # All tasks in one in-memory pipeline must share mode + data_type
-    modes = {t["config"]["mode"] for t in tasks}
-    data_types = {t["config"]["data_type"] for t in tasks}
-
-    if len(modes) != 1:
-        raise ValueError(
-            f"All tasks in a pipeline must share the same mode. Found: {modes}"
-        )
-
-    if len(data_types) != 1:
-        raise ValueError(
-            f"All tasks in a pipeline must share the same data_type. Found: {data_types}"
-        )
-
-    return tasks
+    return {
+        "kind": "pipeline",
+        "name": config["name"],
+        "mode": config["mode"],
+        "data_type": config["data_type"],
+        "requirements": config["requirements"],
+        "steps": loaded_steps,
+    }
 
 
-def run_task_sequence(tasks, data):
-    """
-    Runs tasks in memory, passing the output of one task directly to the next.
-    """
+def run_pipeline_steps(steps: List[Dict[str, Any]], data):
     current_data = data
 
-    for i, task in enumerate(tasks, start=1):
-        task_name = task["config"]["name"]
-        print(f"Running pipeline task {i}/{len(tasks)}: {task_name}")
-        current_data = task["module"].run(current_data)
+    for i, step in enumerate(steps, start=1):
+        step_name = f"{step['module']}:{step['function']}"
+        print(f"Running pipeline step {i}/{len(steps)}: {step_name}")
+        current_data = step["callable"](current_data, **step["kwargs"])
 
         if current_data is None:
             raise ValueError(
-                f"Task '{task_name}' returned None. In pipeline mode, each task "
-                f"must return data for the next task."
+                f"Pipeline step '{step_name}' returned None. "
+                f"Each pipeline step must return data."
             )
 
     return current_data
+
+
+def run_single_task_runner(runner, data):
+    result = runner(data)
+    if result is None:
+        raise ValueError("Task returned None. Expected data output.")
+    return result
 
 
 def save_final_output(loader, data, output_folder, connector, output_name):
@@ -144,10 +202,10 @@ def save_final_output(loader, data, output_folder, connector, output_name):
         raise RuntimeError("No output file was created.")
 
 
-def run_global_pipeline(
+def run_global_execution(
     connector,
     loader,
-    tasks,
+    executable,
     source_folder,
     output_folder,
     output_name,
@@ -170,16 +228,21 @@ def run_global_pipeline(
             connector.download_file(f_info["id"], local_path)
 
         data = loader.load(target_cols)
-        result = run_task_sequence(tasks, data)
+
+        if executable["kind"] == "task":
+            result = run_single_task_runner(executable["runner"], data)
+        else:
+            result = run_pipeline_steps(executable["steps"], data)
+
         save_final_output(loader, result, output_folder, connector, output_name)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def run_batched_pipeline(
+def run_batched_execution(
     connector,
-    tasks,
+    executable,
     source_folder,
     output_folder,
     output_name,
@@ -210,7 +273,11 @@ def run_batched_pipeline(
 
             loader = get_loader(data_type, temp_dir)
             data = loader.load(target_cols)
-            result = run_task_sequence(tasks, data)
+
+            if executable["kind"] == "task":
+                result = run_single_task_runner(executable["runner"], data)
+            else:
+                result = run_pipeline_steps(executable["steps"], data)
 
             batch_output_name = f"{output_name}_batch_{batch_num}"
             save_final_output(loader, result, output_folder, connector, batch_output_name)
@@ -225,52 +292,47 @@ def run_pipeline():
     ts = os.environ.get("TIMESTAMP", "000000")
     batch_size = int(os.environ.get("BATCH_SIZE", 5))
 
-    task_paths = parse_task_paths()
-    tasks = load_pipeline(task_paths)
+    entry = parse_entry_inputs()
+
+    if entry["entry_type"] == "task":
+        executable = load_single_task(entry["path"])
+    else:
+        executable = load_pipeline(entry["path"])
 
     connector = GDriveConnector()
 
-    pipeline_mode = tasks[0]["config"]["mode"]
-    data_type = tasks[0]["config"]["data_type"]
-
-    # For in-memory chaining, the initial raw load should satisfy the FIRST task.
-    # Downstream tasks are expected to consume the previous task's output.
-    first_requirements = tasks[0]["module"].get_requirements()
-    target_cols = first_requirements.get("columns", [])
+    mode = executable["mode"]
+    data_type = executable["data_type"]
+    target_cols = executable["requirements"].get("columns", [])
 
     pipeline_name = os.environ.get("PIPELINE_NAME", "").strip()
-    if pipeline_name:
-        base_name = pipeline_name
-    elif len(tasks) == 1:
-        base_name = tasks[0]["config"]["name"]
-    else:
-        base_name = "__".join([t["config"]["name"] for t in tasks])
-
+    base_name = pipeline_name if pipeline_name else executable["name"]
     output_name = f"{base_name}_{ts}"
 
     print("=== ENGINE CONFIG ===")
-    print(f"Task paths: {task_paths}")
-    print(f"Pipeline mode: {pipeline_mode}")
+    print(f"Entry type: {entry['entry_type']}")
+    print(f"Entry path: {entry['path']}")
+    print(f"Mode: {mode}")
     print(f"Data type: {data_type}")
     print(f"Source folder: {source_folder}")
     print(f"Output folder: {output_folder}")
     print(f"Output name base: {output_name}")
 
-    if pipeline_mode == "global":
+    if mode == "global":
         loader = get_loader(data_type, "temp_all")
-        run_global_pipeline(
+        run_global_execution(
             connector=connector,
             loader=loader,
-            tasks=tasks,
+            executable=executable,
             source_folder=source_folder,
             output_folder=output_folder,
             output_name=f"{output_name}_full",
             target_cols=target_cols,
         )
-    elif pipeline_mode == "batch":
-        run_batched_pipeline(
+    elif mode == "batch":
+        run_batched_execution(
             connector=connector,
-            tasks=tasks,
+            executable=executable,
             source_folder=source_folder,
             output_folder=output_folder,
             output_name=output_name,
@@ -279,7 +341,7 @@ def run_pipeline():
             target_cols=target_cols,
         )
     else:
-        raise ValueError(f"Unsupported mode: {pipeline_mode}")
+        raise ValueError(f"Unsupported mode: {mode}")
 
 
 if __name__ == "__main__":
