@@ -7,7 +7,7 @@ import importlib
 from typing import Any, Dict, List
 
 from data_connectors import get_connector
-from factory_loader import get_loader
+from loader_factory import get_loader
 
 
 def require_env(name: str, allow_empty: bool = False) -> str:
