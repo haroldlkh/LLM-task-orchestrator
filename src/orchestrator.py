@@ -53,7 +53,7 @@ def run_pipeline():
             executable=executable,
             source_location=source_location,
             dest_location=dest_location,
-            output_name=f"{output_name}_full",
+            output_name=f"{output_name}",
             data_type=data_type,
             target_cols=target_cols,
         )
