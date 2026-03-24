@@ -48,6 +48,18 @@ jobs:
         with:
           path: user_repo
 
+      - name: Validate task inputs
+        run: |
+          if [ -n "${{ inputs.task_script }}" ] && [ -n "${{ inputs.task_scripts }}" ]; then
+            echo "Provide either task_script or task_scripts, not both."
+            exit 1
+          fi
+
+          if [ -z "${{ inputs.task_script }}" ] && [ -z "${{ inputs.task_scripts }}" ]; then
+            echo "You must provide one of: task_script or task_scripts."
+            exit 1
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -66,14 +78,19 @@ jobs:
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           OUTPUT_FOLDER_ID: ${{ inputs.output_folder_id }}
           SOURCE_FOLDER_ID: ${{ inputs.source_folder_id }}
-          TASK_SCRIPT: user_repo/${{ inputs.task_script }}
+          TASK_SCRIPT: ${{ inputs.task_script }}
           TASK_SCRIPTS: ${{ inputs.task_scripts }}
           PIPELINE_NAME: ${{ inputs.pipeline_name }}
           BATCH_SIZE: ${{ inputs.batch_size }}
           PYTHONPATH: ${{ github.workspace }}/engine/src
         run: |
+          if [ -n "${TASK_SCRIPT}" ]; then
+            export TASK_SCRIPT="user_repo/${TASK_SCRIPT}"
+          fi
+
           if [ -n "${TASK_SCRIPTS}" ]; then
             export TASK_SCRIPTS=$(echo "${TASK_SCRIPTS}" | sed 's|^|user_repo/|' | sed 's|,|,user_repo/|g')
           fi
+
           export TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
           python engine/src/orchestrator.py
