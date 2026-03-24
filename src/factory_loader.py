@@ -6,7 +6,6 @@ LOADER_REGISTRY = {
 
 
 def get_loader(data_type, temp_dir):
-    """Returns the correct loader instance based on data_type."""
     loader_class = LOADER_REGISTRY.get(data_type.lower())
 
     if not loader_class:

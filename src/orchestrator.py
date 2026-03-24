@@ -15,7 +15,51 @@ def load_user_task(task_path):
     return module
 
 
-def run_global_pipeline(connector, loader, user_module, source_folder, output_folder, wf_name, ts, target_cols):
+def validate_task_module(user_module, task_script):
+    if not hasattr(user_module, "TASK_CONFIG"):
+        raise AttributeError(
+            f"{task_script} must define TASK_CONFIG"
+        )
+
+    if not hasattr(user_module, "get_requirements"):
+        raise AttributeError(
+            f"{task_script} must define get_requirements()"
+        )
+
+    if not hasattr(user_module, "run"):
+        raise AttributeError(
+            f"{task_script} must define run(data)"
+        )
+
+    task_config = user_module.TASK_CONFIG
+
+    if "name" not in task_config:
+        raise KeyError(f"{task_script} TASK_CONFIG must include 'name'")
+
+    if "mode" not in task_config:
+        raise KeyError(f"{task_script} TASK_CONFIG must include 'mode'")
+
+    if "data_type" not in task_config:
+        raise KeyError(f"{task_script} TASK_CONFIG must include 'data_type'")
+
+    if task_config["mode"] not in {"batch", "global"}:
+        raise ValueError(
+            f"{task_script} TASK_CONFIG['mode'] must be 'batch' or 'global'"
+        )
+
+    return task_config
+
+
+def run_global_task(
+    connector,
+    loader,
+    user_module,
+    source_folder,
+    output_folder,
+    task_name,
+    ts,
+    target_cols,
+):
     temp_dir = "temp_all"
     os.makedirs(temp_dir, exist_ok=True)
 
@@ -36,7 +80,7 @@ def run_global_pipeline(connector, loader, user_module, source_folder, output_fo
         processed_data = user_module.run(data)
 
         if processed_data is not None:
-            base_name = f"{wf_name}_{ts}_full"
+            base_name = f"{task_name}_{ts}_full"
             final_filename = loader.save(processed_data, base_name)
 
             if final_filename and os.path.exists(final_filename):
@@ -57,7 +101,17 @@ def run_global_pipeline(connector, loader, user_module, source_folder, output_fo
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def run_batched_pipeline(connector, user_module, source_folder, output_folder, wf_name, ts, batch_size, data_type, target_cols):
+def run_batched_task(
+    connector,
+    user_module,
+    source_folder,
+    output_folder,
+    task_name,
+    ts,
+    batch_size,
+    data_type,
+    target_cols,
+):
     all_files = [
         f for f in connector.list_files_in_folder(source_folder)
         if f["name"].endswith(".parquet")
@@ -85,7 +139,7 @@ def run_batched_pipeline(connector, user_module, source_folder, output_folder, w
             processed_data = user_module.run(data)
 
             if processed_data is not None:
-                base_name = f"{wf_name}_{ts}_batch_{batch_num}"
+                base_name = f"{task_name}_{ts}_batch_{batch_num}"
                 final_filename = loader.save(processed_data, base_name)
 
                 if final_filename and os.path.exists(final_filename):
@@ -109,53 +163,51 @@ def run_batched_pipeline(connector, user_module, source_folder, output_folder, w
 def run_pipeline():
     source_folder = os.environ["SOURCE_FOLDER_ID"]
     output_folder = os.environ["OUTPUT_FOLDER_ID"]
-
-    wf_name = os.environ.get("WORKFLOW_NAME", "task").replace(" ", "_")
-    ts = os.environ.get("TIMESTAMP", "000000")
-
-    batch_size = int(os.environ.get("BATCH_SIZE", 5))
     task_script = os.environ["TASK_SCRIPT"]
-    data_type = os.environ.get("DATA_TYPE", "tabular")
-    process_mode = os.environ.get("PROCESS_MODE", "batch").lower()
+    ts = os.environ.get("TIMESTAMP", "000000")
+    batch_size = int(os.environ.get("BATCH_SIZE", 5))
 
     connector = GDriveConnector()
     user_module = load_user_task(task_script)
+    task_config = validate_task_module(user_module, task_script)
 
-    if not hasattr(user_module, "get_requirements"):
-        raise AttributeError(f"{task_script} must define get_requirements()")
-
-    if not hasattr(user_module, "run"):
-        raise AttributeError(f"{task_script} must define run(data)")
+    task_name = task_config["name"]
+    task_mode = task_config["mode"]
+    data_type = task_config["data_type"]
 
     requirements = user_module.get_requirements()
     target_cols = requirements.get("columns", [])
 
-    if process_mode == "global":
+    print(f"Running task: {task_name}")
+    print(f"Task mode: {task_mode}")
+    print(f"Data type: {data_type}")
+
+    if task_mode == "global":
         loader = get_loader(data_type, "temp_all")
-        run_global_pipeline(
+        run_global_task(
             connector=connector,
             loader=loader,
             user_module=user_module,
             source_folder=source_folder,
             output_folder=output_folder,
-            wf_name=wf_name,
+            task_name=task_name,
             ts=ts,
             target_cols=target_cols,
         )
-    elif process_mode == "batch":
-        run_batched_pipeline(
+    elif task_mode == "batch":
+        run_batched_task(
             connector=connector,
             user_module=user_module,
             source_folder=source_folder,
             output_folder=output_folder,
-            wf_name=wf_name,
+            task_name=task_name,
             ts=ts,
             batch_size=batch_size,
             data_type=data_type,
             target_cols=target_cols,
         )
     else:
-        raise ValueError("PROCESS_MODE must be either 'batch' or 'global'")
+        raise ValueError(f"Unsupported task mode: {task_mode}")
 
 
 if __name__ == "__main__":

@@ -19,13 +19,10 @@ class GDriveConnector:
             scopes=self.scopes,
         )
 
-        # Exchange refresh token for short-lived access token
         self.creds.refresh(Request())
-
         self.service = build("drive", "v3", credentials=self.creds)
 
     def list_files_in_folder(self, folder_id):
-        """Returns all non-folder files in the given folder."""
         query = (
             f"'{folder_id}' in parents "
             f"and trashed = false "
@@ -53,7 +50,6 @@ class GDriveConnector:
         return files
 
     def download_file(self, file_id, destination):
-        """Downloads a Drive file to a local destination."""
         request = self.service.files().get_media(fileId=file_id)
 
         with io.FileIO(destination, "wb") as fh:
@@ -63,7 +59,6 @@ class GDriveConnector:
                 _, done = downloader.next_chunk()
 
     def upload_file(self, local_path, folder_id, remote_name):
-        """Uploads a local file to the target Drive folder."""
         file_metadata = {
             "name": remote_name,
             "parents": [folder_id],
