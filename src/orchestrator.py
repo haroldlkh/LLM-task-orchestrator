@@ -12,6 +12,7 @@ def run_pipeline():
 
     source_connector_config = parse_json_env("SOURCE_CONNECTOR_CONFIG_JSON", allow_empty=True)
     dest_connector_config = parse_json_env("DEST_CONNECTOR_CONFIG_JSON", allow_empty=True)
+    user_runtime_config = parse_json_env("USER_RUNTIME_CONFIG_JSON", allow_empty=True)
 
     ts = require_env("TIMESTAMP")
     batch_size = int(require_env("BATCH_SIZE"))
@@ -56,6 +57,7 @@ def run_pipeline():
             output_name=f"{output_name}",
             data_type=data_type,
             target_cols=target_cols,
+            user_runtime_config=user_runtime_config,
         )
     elif mode == "batch":
         run_batched_execution(
@@ -68,6 +70,7 @@ def run_pipeline():
             batch_size=batch_size,
             data_type=data_type,
             target_cols=target_cols,
+            user_runtime_config=user_runtime_config,
         )
     else:
         raise ValueError(f"Unsupported mode: {mode}")

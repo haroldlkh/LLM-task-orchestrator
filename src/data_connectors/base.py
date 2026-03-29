@@ -17,3 +17,11 @@ class BaseConnector(ABC):
     @abstractmethod
     def upload_object(self, local_path: str, destination: str, remote_name: str) -> str:
         raise NotImplementedError
+
+    @abstractmethod
+    def ensure_subdir(self, parent_location: str, name: str) -> str:
+        """
+        Ensure a child directory/folder exists under parent_location.
+        Return the connector-specific location/id for that subdir.
+        """
+        raise NotImplementedError

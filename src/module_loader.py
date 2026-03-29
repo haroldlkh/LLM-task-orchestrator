@@ -5,6 +5,13 @@ import sys
 from typing import Any, Dict
 
 
+ENGINE_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+ENGINE_ROOT = os.path.dirname(ENGINE_SRC_DIR)
+
+if ENGINE_ROOT not in sys.path:
+    sys.path.insert(0, ENGINE_ROOT)
+
+
 def add_user_repo_to_path(path_in_repo: str) -> str:
     abs_path = os.path.abspath(path_in_repo)
     repo_root = abs_path.split(os.sep + "user_repo" + os.sep)[0] + os.sep + "user_repo"
@@ -87,12 +94,57 @@ def validate_pipeline_config(pipeline_module, pipeline_path: str):
         raise ValueError(f"{pipeline_path} PIPELINE_CONFIG['steps'] must be a non-empty list")
 
     for i, step in enumerate(config["steps"], start=1):
-        if "module" not in step or "function" not in step:
-            raise KeyError(
-                f"{pipeline_path} step {i} must include 'module' and 'function'"
-            )
+        if step.get("type") == "llm":
+            required = [
+                "name",
+                "adapter",
+                "provider_config_key",
+                "model",
+                "row_id_column",
+                "input_columns",
+                "output_columns",
+            ]
+            missing = [k for k in required if k not in step]
+            if missing:
+                raise KeyError(
+                    f"{pipeline_path} llm step {i} missing required keys: {missing}"
+                )
+        else:
+            if "module" not in step or "function" not in step:
+                raise KeyError(
+                    f"{pipeline_path} normal step {i} must include 'module' and 'function'"
+                )
 
     return config
+
+
+def _resolve_normal_step(step: Dict[str, Any]) -> Dict[str, Any]:
+    module_name = step["module"]
+    function_name = step["function"]
+    module = importlib.import_module(module_name)
+
+    if not hasattr(module, function_name):
+        raise AttributeError(
+            f"Pipeline step module '{module_name}' does not have "
+            f"function '{function_name}'"
+        )
+
+    fn = getattr(module, function_name)
+
+    return {
+        "kind": "normal",
+        "module": module_name,
+        "function": function_name,
+        "callable": fn,
+        "kwargs": step.get("kwargs", {}),
+    }
+
+
+def _resolve_llm_step(step: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "kind": "llm",
+        "config": step,
+    }
 
 
 def load_pipeline(pipeline_path: str) -> Dict[str, Any]:
@@ -103,26 +155,10 @@ def load_pipeline(pipeline_path: str) -> Dict[str, Any]:
 
     loaded_steps = []
     for step in config["steps"]:
-        module = importlib.import_module(step["module"])
-        function_name = step["function"]
-
-        if not hasattr(module, function_name):
-            raise AttributeError(
-                f"Pipeline step module '{step['module']}' does not have "
-                f"function '{function_name}'"
-            )
-
-        fn = getattr(module, function_name)
-        kwargs = step.get("kwargs", {})
-
-        loaded_steps.append(
-            {
-                "module": step["module"],
-                "function": function_name,
-                "callable": fn,
-                "kwargs": kwargs,
-            }
-        )
+        if step.get("type") == "llm":
+            loaded_steps.append(_resolve_llm_step(step))
+        else:
+            loaded_steps.append(_resolve_normal_step(step))
 
     return {
         "kind": "pipeline",

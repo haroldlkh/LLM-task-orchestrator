@@ -9,22 +9,6 @@ from .base import BaseConnector
 
 
 class GDriveConnector(BaseConnector):
-    """
-    Supported auth modes via config JSON:
-
-    1) oauth_user
-       For personal Google accounts or any case where uploads should use
-       a human user's Drive quota.
-
-    2) service_account
-       For server-to-server auth as the service account itself.
-       Suitable for shared-drive workflows, not personal My Drive uploads.
-
-    3) service_account_delegated
-       For Google Workspace with domain-wide delegation.
-       Service account impersonates a Workspace user via delegated_subject.
-    """
-
     DEFAULT_SCOPES = ["https://www.googleapis.com/auth/drive"]
     DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token"
 
@@ -159,3 +143,36 @@ class GDriveConnector(BaseConnector):
         ).execute()
 
         return result["id"]
+
+    def ensure_subdir(self, parent_location: str, name: str) -> str:
+        query = (
+            f"'{parent_location}' in parents "
+            f"and trashed = false "
+            f"and mimeType = 'application/vnd.google-apps.folder' "
+            f"and name = '{name}'"
+        )
+
+        results = self.service.files().list(
+            q=query,
+            fields="files(id, name)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+
+        files = results.get("files", [])
+        if files:
+            return files[0]["id"]
+
+        metadata = {
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_location],
+        }
+
+        folder = self.service.files().create(
+            body=metadata,
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+
+        return folder["id"]

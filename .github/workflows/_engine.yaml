@@ -3,10 +3,6 @@ name: Engine Logic
 on:
   workflow_call:
     inputs:
-      user_requirements_file:
-        required: false
-        default: ""
-        type: string
       source_connector:
         required: true
         type: string
@@ -34,10 +30,16 @@ on:
       batch_size:
         default: "5"
         type: string
+      user_requirements_file:
+        required: false
+        default: ""
+        type: string
     secrets:
       SOURCE_CONNECTOR_CONFIG_JSON:
         required: false
       DEST_CONNECTOR_CONFIG_JSON:
+        required: false
+      USER_RUNTIME_CONFIG_JSON:
         required: false
 
 jobs:
@@ -92,6 +94,7 @@ jobs:
           DEST_LOCATION: ${{ inputs.dest_location }}
           SOURCE_CONNECTOR_CONFIG_JSON: ${{ secrets.SOURCE_CONNECTOR_CONFIG_JSON }}
           DEST_CONNECTOR_CONFIG_JSON: ${{ secrets.DEST_CONNECTOR_CONFIG_JSON }}
+          USER_RUNTIME_CONFIG_JSON: ${{ secrets.USER_RUNTIME_CONFIG_JSON }}
           TASK_SCRIPT: ${{ inputs.task_script }}
           PIPELINE_SCRIPT: ${{ inputs.pipeline_script }}
           PIPELINE_NAME: ${{ inputs.pipeline_name }}

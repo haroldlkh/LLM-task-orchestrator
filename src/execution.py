@@ -2,16 +2,30 @@ import os
 import shutil
 from typing import Any, Dict, List
 
-from loader_factory import get_loader
+from factory_loader import get_loader
+from llm.executor import execute_llm_step
 
 
-def run_pipeline_steps(steps: List[Dict[str, Any]], data):
+def run_pipeline_steps(
+    steps: List[Dict[str, Any]],
+    data,
+    runtime_context: Dict[str, Any],
+):
     current_data = data
 
     for i, step in enumerate(steps, start=1):
-        step_name = f"{step['module']}:{step['function']}"
-        print(f"Running pipeline step {i}/{len(steps)}: {step_name}")
-        current_data = step["callable"](current_data, **step["kwargs"])
+        if step["kind"] == "llm":
+            step_name = step["config"]["name"]
+            print(f"Running llm pipeline step {i}/{len(steps)}: {step_name}")
+            current_data = execute_llm_step(
+                data=current_data,
+                step_config=step["config"],
+                runtime_context=runtime_context,
+            )
+        else:
+            step_name = f"{step['module']}:{step['function']}"
+            print(f"Running pipeline step {i}/{len(steps)}: {step_name}")
+            current_data = step["callable"](current_data, **step["kwargs"])
 
         if current_data is None:
             raise ValueError(
@@ -50,6 +64,7 @@ def run_global_execution(
     output_name,
     data_type,
     target_cols,
+    user_runtime_config,
 ):
     temp_dir = "temp_all"
     os.makedirs(temp_dir, exist_ok=True)
@@ -73,7 +88,14 @@ def run_global_execution(
         if executable["kind"] == "task":
             result = run_single_task_runner(executable["runner"], data)
         else:
-            result = run_pipeline_steps(executable["steps"], data)
+            runtime_context = {
+                "dest_connector": dest_connector,
+                "dest_location": dest_location,
+                "pipeline_name": executable["name"],
+                "temp_dir": temp_dir,
+                "user_runtime_config": user_runtime_config,
+            }
+            result = run_pipeline_steps(executable["steps"], data, runtime_context)
 
         save_final_output(loader, result, dest_location, dest_connector, output_name)
 
@@ -91,6 +113,7 @@ def run_batched_execution(
     batch_size,
     data_type,
     target_cols,
+    user_runtime_config,
 ):
     all_files = [
         f for f in source_connector.list_objects(source_location)
@@ -119,7 +142,14 @@ def run_batched_execution(
             if executable["kind"] == "task":
                 result = run_single_task_runner(executable["runner"], data)
             else:
-                result = run_pipeline_steps(executable["steps"], data)
+                runtime_context = {
+                    "dest_connector": dest_connector,
+                    "dest_location": dest_location,
+                    "pipeline_name": executable["name"],
+                    "temp_dir": temp_dir,
+                    "user_runtime_config": user_runtime_config,
+                }
+                result = run_pipeline_steps(executable["steps"], data, runtime_context)
 
             batch_output_name = f"{output_name}_batch_{batch_num}"
             save_final_output(loader, result, dest_location, dest_connector, batch_output_name)
