@@ -34,6 +34,7 @@ def default_runtime(step_config: dict) -> dict:
         "throughput_tolerance": runtime.get("throughput_tolerance", 0.05),
         "throughput_ema_alpha": runtime.get("throughput_ema_alpha", 0.30),
         "mild_shrink_factor": runtime.get("mild_shrink_factor", 0.9),
+        "max_concurrent_requests": runtime.get("max_concurrent_requests", 4),
     }
 
 
@@ -118,6 +119,10 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'throughput_tolerance' must be >= 0")
     if not 0 < runtime["throughput_ema_alpha"] <= 1:
         raise ValueError("LLM runtime 'throughput_ema_alpha' must be > 0 and <= 1")
+    if runtime["max_concurrent_requests"] < 1:
+        raise ValueError("LLM runtime 'max_concurrent_requests' must be >= 1")
+    if runtime["max_concurrent_requests"] >= 8:
+        raise ValueError("LLM runtime 'max_concurrent_requests' must be < 8 for safe Gemini concurrency")
 
 
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:

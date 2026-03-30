@@ -236,7 +236,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             f"already_terminal={len(terminal_ids)} pending_units={pending_units_df.height} "
             f"initial_group_size={runtime['initial_group_size']} min_group_size={runtime['min_group_size']} "
             f"max_group_size={runtime['max_group_size']} flush_scope={runtime['flush_scope']} "
-            f"max_flushes_per_run={runtime['max_flushes_per_run']} workflow_folder={pipeline_name}"
+            f"max_flushes_per_run={runtime['max_flushes_per_run']} "
+            f"max_concurrent_requests={runtime['max_concurrent_requests']} workflow_folder={pipeline_name}"
         ),
         flush=True,
     )
