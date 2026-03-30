@@ -9,7 +9,6 @@ from .batch_runtime import (
     ControllerState,
     choose_next_controller_state,
     derive_group_size,
-    flush_buffers,
     log_progress,
     merge_progress_rows_in_memory,
     request_score,
@@ -22,12 +21,22 @@ from .validators import (
 )
 
 
-def _build_wave_requests(pending_rows, cursor, group_size, concurrency, step_config, task_handler, prompt_context):
+def _build_wave_requests(
+    pending_rows,
+    cursor,
+    group_size,
+    concurrency,
+    step_config,
+    task_handler,
+    prompt_context,
+):
     wave = []
     next_cursor = cursor
+
     for _ in range(concurrency):
         if next_cursor >= len(pending_rows):
             break
+
         group_units = pending_rows[next_cursor: next_cursor + group_size]
         next_cursor += len(group_units)
 
@@ -39,10 +48,14 @@ def _build_wave_requests(pending_rows, cursor, group_size, concurrency, step_con
                 "Grouped batching expects task_handler.build_requests(...) "
                 "to return exactly one grouped request per group"
             )
-        wave.append({
-            "group_units": group_units,
-            "request": requests[0],
-        })
+
+        wave.append(
+            {
+                "group_units": group_units,
+                "request": requests[0],
+            }
+        )
+
     return wave, next_cursor
 
 
@@ -53,10 +66,15 @@ def _execute_wave_requests(adapter, wave, step_config, runtime):
 
     last_exception = None
     adapter_results = None
+    final_attempt_count = 0
 
     for attempt in range(max_request_retries + 1):
+        final_attempt_count = attempt + 1
         try:
-            adapter_results = adapter.execute_batch([item["request"] for item in wave], step_config)
+            adapter_results = adapter.execute_batch(
+                [item["request"] for item in wave],
+                step_config,
+            )
             validate_grouped_adapter_batch_results(adapter_results, request_ids)
             last_exception = None
             break
@@ -75,7 +93,7 @@ def _execute_wave_requests(adapter, wave, step_config, runtime):
             )
             time.sleep(retry_backoff_seconds * (attempt + 1))
 
-    return adapter_results, last_exception
+    return adapter_results, last_exception, final_attempt_count
 
 
 def process_batches(
@@ -172,7 +190,7 @@ def process_batches(
         )
 
         wave_start = time.time()
-        adapter_results, last_exception = _execute_wave_requests(
+        adapter_results, last_exception, wave_attempt_count = _execute_wave_requests(
             adapter=adapter,
             wave=wave,
             step_config=step_config,
@@ -198,6 +216,7 @@ def process_batches(
                     error_type="wave_request_exception",
                     error_message=str(last_exception),
                     progress_df=progress_df,
+                    request_attempt_count=wave_attempt_count,
                 )
                 pending_progress_rows.extend(progress_rows)
                 pending_debug_rows.extend(debug_rows)
@@ -252,6 +271,11 @@ def process_batches(
                 request_seconds = float(request_result.get("request_seconds", 0.0) or 0.0)
                 if request_seconds <= 0:
                     request_seconds = max(time.time() - wave_start, 1e-9)
+
+                request_attempt_count = int(
+                    request_result.get("request_attempt_count", wave_attempt_count) or wave_attempt_count
+                )
+
                 wave_metrics["elapsed_request_seconds"] += request_seconds
                 wave_metrics["processed_units"] += group_len
 
@@ -261,6 +285,7 @@ def process_batches(
                         request=request,
                         request_result=request_result,
                         progress_df=progress_df,
+                        request_attempt_count=request_attempt_count,
                     )
                     pending_progress_rows.extend(progress_rows)
                     pending_debug_rows.extend(debug_rows)
@@ -302,6 +327,7 @@ def process_batches(
                         request_result=request_result,
                         parse_results=parse_results,
                         progress_df=progress_df,
+                        request_attempt_count=request_attempt_count,
                     )
 
                     pending_progress_rows.extend(progress_rows)
@@ -347,6 +373,7 @@ def process_batches(
                         error_type="group_parse_exception",
                         error_message=str(e),
                         progress_df=progress_df,
+                        request_attempt_count=request_attempt_count,
                     )
                     pending_progress_rows.extend(progress_rows)
                     pending_debug_rows.extend(debug_rows)
@@ -433,7 +460,10 @@ def process_batches(
 
             if flush_payload and flush_payload.get("counted_flush"):
                 completed_flushes += 1
-                if runtime.get("max_flushes_per_run") is not None and completed_flushes >= runtime["max_flushes_per_run"]:
+                if (
+                    runtime.get("max_flushes_per_run") is not None
+                    and completed_flushes >= runtime["max_flushes_per_run"]
+                ):
                     log_progress(
                         step_name=step_config["name"],
                         wave_index=wave_index,
