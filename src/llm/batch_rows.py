@@ -28,7 +28,7 @@ def mark_group_transport_failure(
     request,
     request_result,
     progress_df,
-    request_attempt_count: int,
+    request_attempt_count,
 ):
     now = utc_now_iso()
     progress_rows = []
@@ -86,7 +86,7 @@ def mark_group_parse_failure(
     error_type,
     error_message,
     progress_df,
-    request_attempt_count: int,
+    request_attempt_count,
 ):
     now = utc_now_iso()
     progress_rows = []
@@ -141,7 +141,7 @@ def build_rows_from_group_parse(
     request_result,
     parse_results,
     progress_df,
-    request_attempt_count: int,
+    request_attempt_count,
 ):
     now = utc_now_iso()
     progress_rows = []
