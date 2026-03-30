@@ -4,6 +4,16 @@ import polars as pl
 
 from .adapter_loader import build_adapter
 from .batch_processor import process_batches
+from .dataframes import (
+    debug_rows_to_df,
+    empty_progress_df,
+    empty_result_df,
+    ensure_progress_df,
+    ensure_result_df,
+    result_rows_to_df,
+    progress_rows_to_df,
+)
+from .llm_task_loader import build_task_handler
 from .merge import merge_results_back
 from .prompt_loader import load_prompt_context
 from .runtime import (
@@ -19,8 +29,6 @@ from .state import (
     upload_versioned_json,
     upload_versioned_parquet,
 )
-from .llm_task_loader import build_task_handler
-from .traces import debug_rows_to_df, progress_rows_to_df, result_rows_to_df
 from .work_units import build_work_units
 
 
@@ -32,8 +40,8 @@ def _load_existing_progress(connector, state_folder: str, temp_dir: str) -> pl.D
         temp_dir=temp_dir,
     )
     if progress_df is None:
-        return progress_rows_to_df([])
-    return progress_df
+        return empty_progress_df()
+    return ensure_progress_df(progress_df)
 
 
 def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.DataFrame:
@@ -44,29 +52,30 @@ def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.
         temp_dir=temp_dir,
     )
     if not chunks:
-        return result_rows_to_df([])
-    return pl.concat(chunks, how="vertical_relaxed")
+        return empty_result_df()
+
+    normalized = [ensure_result_df(chunk) for chunk in chunks]
+    return pl.concat(normalized, how="vertical_relaxed")
 
 
 def _merge_progress(base_progress: pl.DataFrame, new_progress: pl.DataFrame) -> pl.DataFrame:
     if base_progress.is_empty():
-        return new_progress
+        return ensure_progress_df(new_progress)
 
-    combined = pl.concat([base_progress, new_progress], how="vertical_relaxed")
+    combined = pl.concat(
+        [ensure_progress_df(base_progress), ensure_progress_df(new_progress)],
+        how="vertical_relaxed",
+    )
     combined = combined.sort(["unit_id", "updated_at"])
     latest = combined.group_by("unit_id").tail(1)
-    return latest
+    return ensure_progress_df(latest)
 
 
-def _flush_state(
+def _upload_manifest(
     connector,
     folders: dict,
     temp_dir: str,
     work_units_df: pl.DataFrame,
-    progress_df: pl.DataFrame,
-    result_rows,
-    debug_rows,
-    metadata: dict,
 ):
     upload_versioned_parquet(
         connector=connector,
@@ -76,11 +85,21 @@ def _flush_state(
         temp_dir=temp_dir,
     )
 
+
+def _flush_incremental_state(
+    connector,
+    folders: dict,
+    temp_dir: str,
+    progress_df: pl.DataFrame,
+    result_rows,
+    debug_rows,
+    metadata: dict,
+):
     upload_versioned_parquet(
         connector=connector,
         location=folders["state_folder"],
         prefix="progress",
-        df=progress_df,
+        df=ensure_progress_df(progress_df),
         temp_dir=temp_dir,
     )
 
@@ -114,6 +133,39 @@ def _flush_state(
                 df=review_df,
                 temp_dir=temp_dir,
             )
+
+    upload_versioned_json(
+        connector=connector,
+        location=folders["state_folder"],
+        prefix="metadata",
+        payload=metadata,
+        temp_dir=temp_dir,
+    )
+
+
+def _flush_final_state(
+    connector,
+    folders: dict,
+    temp_dir: str,
+    work_units_df: pl.DataFrame,
+    progress_df: pl.DataFrame,
+    metadata: dict,
+):
+    upload_versioned_parquet(
+        connector=connector,
+        location=folders["state_folder"],
+        prefix="manifest",
+        df=work_units_df,
+        temp_dir=temp_dir,
+    )
+
+    upload_versioned_parquet(
+        connector=connector,
+        location=folders["state_folder"],
+        prefix="progress",
+        df=ensure_progress_df(progress_df),
+        temp_dir=temp_dir,
+    )
 
     upload_versioned_json(
         connector=connector,
@@ -172,8 +224,30 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     terminal_ids = success_or_terminal_unit_ids(progress_df)
     pending_units_df = work_units_df.filter(~pl.col("unit_id").is_in(list(terminal_ids)))
 
+    print(
+        (
+            f"[llm:{step_config['name']}] "
+            f"start "
+            f"total_units={work_units_df.height} "
+            f"already_terminal={len(terminal_ids)} "
+            f"pending_units={pending_units_df.height} "
+            f"initial_group_size={runtime['initial_group_size']} "
+            f"min_group_size={runtime['min_group_size']} "
+            f"max_group_size={runtime['max_group_size']}"
+        ),
+        flush=True,
+    )
+
+    _upload_manifest(
+        connector=dest_connector,
+        folders=folders,
+        temp_dir=temp_dir,
+        work_units_df=work_units_df,
+    )
+
     if pending_units_df.is_empty():
         from .models import LLMRunOutcome
+
         outcome = LLMRunOutcome(
             status="complete",
             processed_units=0,
@@ -185,14 +259,12 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             progress_df=progress_df,
             outcome=outcome,
         )
-        _flush_state(
+        _flush_final_state(
             connector=dest_connector,
             folders=folders,
             temp_dir=temp_dir,
             work_units_df=work_units_df,
             progress_df=progress_df,
-            result_rows=[],
-            debug_rows=[],
             metadata=metadata,
         )
         return merge_results_back(
@@ -204,6 +276,55 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
 
     start_time = time.time()
+
+    def flush_callback(payload: dict):
+        nonlocal progress_df
+
+        new_progress_df = progress_rows_to_df(payload["progress_rows"])
+        if not new_progress_df.is_empty():
+            progress_df = _merge_progress(progress_df, new_progress_df)
+
+        partial_outcome = {
+            "status": "running",
+            "processed_units": payload["processed_units"],
+            "remaining_units": payload["remaining_units"],
+        }
+
+        from .models import LLMRunOutcome
+
+        metadata = build_runtime_metadata(
+            step_config=step_config,
+            work_units_df=work_units_df,
+            progress_df=progress_df,
+            outcome=LLMRunOutcome(**partial_outcome),
+        )
+        metadata["current_group_size"] = payload["current_group_size"]
+        metadata["success_streak"] = payload["success_streak"]
+
+        _flush_incremental_state(
+            connector=dest_connector,
+            folders=folders,
+            temp_dir=temp_dir,
+            progress_df=progress_df,
+            result_rows=payload["result_rows"],
+            debug_rows=payload["debug_rows"],
+            metadata=metadata,
+        )
+
+        print(
+            (
+                f"[llm:{step_config['name']}] "
+                f"checkpoint "
+                f"processed_units={payload['processed_units']} "
+                f"remaining_units={payload['remaining_units']} "
+                f"current_group_size={payload['current_group_size']} "
+                f"progress_rows={len(payload['progress_rows'])} "
+                f"result_rows={len(payload['result_rows'])} "
+                f"debug_rows={len(payload['debug_rows'])}"
+            ),
+            flush=True,
+        )
+
     batch_out = process_batches(
         pending_rows=pending_units_df.to_dicts(),
         step_config=step_config,
@@ -213,11 +334,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         prompt_context=prompt_context,
         progress_df=progress_df,
         start_time=start_time,
+        flush_callback=flush_callback,
     )
-
-    new_progress_df = progress_rows_to_df(batch_out["progress_rows"])
-    if not new_progress_df.is_empty():
-        progress_df = _merge_progress(progress_df, new_progress_df)
 
     metadata = build_runtime_metadata(
         step_config=step_config,
@@ -226,15 +344,24 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         outcome=batch_out["outcome"],
     )
 
-    _flush_state(
+    _flush_final_state(
         connector=dest_connector,
         folders=folders,
         temp_dir=temp_dir,
         work_units_df=work_units_df,
         progress_df=progress_df,
-        result_rows=batch_out["result_rows"],
-        debug_rows=batch_out["debug_rows"],
         metadata=metadata,
+    )
+
+    print(
+        (
+            f"[llm:{step_config['name']}] "
+            f"final_flush "
+            f"processed_units={batch_out['outcome'].processed_units} "
+            f"remaining_units={batch_out['outcome'].remaining_units} "
+            f"outcome={batch_out['outcome'].status}"
+        ),
+        flush=True,
     )
 
     existing_results_df = _load_existing_results(

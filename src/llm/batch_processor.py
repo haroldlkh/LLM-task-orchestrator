@@ -1,204 +1,23 @@
-import json
-import math
 import time
 
-from .models import LLMProgressRecord, LLMResultRecord, LLMRunOutcome
-from .runtime import current_retry_count
-from .state import utc_now_iso
+from .batch_rows import (
+    build_rows_from_group_parse,
+    mark_group_parse_failure,
+    mark_group_transport_failure,
+)
+from .batch_runtime import (
+    flush_buffers,
+    log_progress,
+    merge_progress_rows_in_memory,
+    next_larger_group_size,
+    next_smaller_group_size,
+    should_flush,
+)
+from .models import LLMRunOutcome
 from .validators import (
     validate_grouped_adapter_batch_results,
     validate_grouped_parse_results,
 )
-
-
-def _next_smaller_group_size(current_size: int, min_size: int, shrink_factor: float) -> int:
-    shrunk = max(min_size, int(math.floor(current_size * shrink_factor)))
-    if shrunk == current_size and current_size > min_size:
-        shrunk = current_size - 1
-    return max(min_size, shrunk)
-
-
-def _next_larger_group_size(current_size: int, max_size: int, grow_step: int) -> int:
-    return min(max_size, current_size + grow_step)
-
-
-def _mark_group_transport_failure(
-    group_units,
-    request,
-    request_result,
-    progress_df,
-):
-    now = utc_now_iso()
-    progress_rows = []
-    debug_rows = []
-
-    for unit in group_units:
-        retry_count = current_retry_count(progress_df, unit["unit_id"])
-        if request_result["status"] == "retryable_error":
-            retry_count += 1
-
-        progress_rows.append(
-            LLMProgressRecord(
-                unit_id=unit["unit_id"],
-                status=request_result["status"],
-                retry_count=retry_count,
-                last_error_type=request_result.get("error_type"),
-                last_error_message=request_result.get("error_message"),
-                updated_at=now,
-            ).to_dict()
-        )
-
-        debug_rows.append({
-            "unit_id": unit["unit_id"],
-            "row_id": unit["row_id"],
-            "field_name": unit["field_name"],
-            "output_column": unit["output_column"],
-            "status": request_result["status"],
-            "review_flag": True,
-            "review_reason": "group_transport_failure",
-            "error_type": request_result.get("error_type"),
-            "error_message": request_result.get("error_message"),
-            "input_text": unit["input_text"],
-            "rendered_prompt": request["prompt"],
-            "raw_output": request_result.get("raw_output"),
-            "parsed_output": None,
-            "output_value": None,
-            "updated_at": now,
-        })
-
-    return progress_rows, debug_rows
-
-
-def _mark_group_parse_failure(
-    group_units,
-    request,
-    raw_output,
-    error_type,
-    error_message,
-    progress_df,
-):
-    now = utc_now_iso()
-    progress_rows = []
-    debug_rows = []
-
-    for unit in group_units:
-        retry_count = current_retry_count(progress_df, unit["unit_id"]) + 1
-
-        progress_rows.append(
-            LLMProgressRecord(
-                unit_id=unit["unit_id"],
-                status="retryable_error",
-                retry_count=retry_count,
-                last_error_type=error_type,
-                last_error_message=error_message,
-                updated_at=now,
-            ).to_dict()
-        )
-
-        debug_rows.append({
-            "unit_id": unit["unit_id"],
-            "row_id": unit["row_id"],
-            "field_name": unit["field_name"],
-            "output_column": unit["output_column"],
-            "status": "retryable_error",
-            "review_flag": True,
-            "review_reason": "group_parse_failure",
-            "error_type": error_type,
-            "error_message": error_message,
-            "input_text": unit["input_text"],
-            "rendered_prompt": request["prompt"],
-            "raw_output": raw_output,
-            "parsed_output": None,
-            "output_value": None,
-            "updated_at": now,
-        })
-
-    return progress_rows, debug_rows
-
-
-def _build_rows_from_group_parse(
-    group_units,
-    request,
-    request_result,
-    parse_results,
-    progress_df,
-):
-    now = utc_now_iso()
-    progress_rows = []
-    result_rows = []
-    debug_rows = []
-
-    parse_lookup = {row["unit_id"]: row for row in parse_results}
-
-    for unit in group_units:
-        parsed = parse_lookup[unit["unit_id"]]
-
-        retry_count = current_retry_count(progress_df, unit["unit_id"])
-        if parsed["status"] == "retryable_error":
-            retry_count += 1
-
-        progress_rows.append(
-            LLMProgressRecord(
-                unit_id=unit["unit_id"],
-                status=parsed["status"],
-                retry_count=retry_count,
-                last_error_type=parsed.get("error_type"),
-                last_error_message=parsed.get("error_message"),
-                updated_at=now,
-            ).to_dict()
-        )
-
-        review_flag = parsed.get("review_flag", False)
-        review_reason = parsed.get("review_reason")
-        if parsed["status"] != "success":
-            review_flag = True
-            if review_reason is None:
-                review_reason = "group_unit_non_success"
-
-        debug_rows.append({
-            "unit_id": unit["unit_id"],
-            "row_id": unit["row_id"],
-            "field_name": unit["field_name"],
-            "output_column": unit["output_column"],
-            "status": parsed["status"],
-            "review_flag": review_flag,
-            "review_reason": review_reason,
-            "error_type": parsed.get("error_type"),
-            "error_message": parsed.get("error_message"),
-            "input_text": unit["input_text"],
-            "rendered_prompt": request["prompt"],
-            "raw_output": request_result.get("raw_output"),
-            "parsed_output": (
-                parsed["parsed_output"]
-                if isinstance(parsed.get("parsed_output"), str)
-                else json.dumps(parsed.get("parsed_output"), ensure_ascii=False)
-            ) if parsed.get("parsed_output") is not None else None,
-            "output_value": parsed.get("output_value"),
-            "updated_at": now,
-        })
-
-        if parsed["status"] == "success":
-            result_rows.append(
-                LLMResultRecord(
-                    unit_id=unit["unit_id"],
-                    row_id=unit["row_id"],
-                    output_column=unit["output_column"],
-                    status="success",
-                    parsed_output=(
-                        parsed["parsed_output"]
-                        if isinstance(parsed["parsed_output"], str)
-                        else json.dumps(parsed["parsed_output"], ensure_ascii=False)
-                    ) if parsed.get("parsed_output") is not None else None,
-                    output_value=parsed.get("output_value"),
-                    raw_output=request_result.get("raw_output"),
-                    error_type=parsed.get("error_type"),
-                    error_message=parsed.get("error_message"),
-                    review_flag=review_flag,
-                    review_reason=review_reason,
-                ).to_dict()
-            )
-
-    return progress_rows, result_rows, debug_rows
 
 
 def process_batches(
@@ -210,6 +29,7 @@ def process_batches(
     prompt_context,
     progress_df,
     start_time,
+    flush_callback,
 ):
     soft_time_limit_seconds = runtime["soft_time_limit_minutes"] * 60
     max_request_retries = runtime["max_request_retries"]
@@ -221,27 +41,62 @@ def process_batches(
     grow_after_successes = runtime["grow_after_successes"]
     grow_step = runtime["grow_step"]
     shrink_factor = runtime["shrink_factor"]
+    log_every_n_groups = runtime["log_every_n_groups"]
 
+    total_units = len(pending_rows)
     processed_count = 0
-    batch_result_rows = []
-    batch_progress_rows = []
-    batch_debug_rows = []
 
+    pending_result_rows = []
+    pending_progress_rows = []
+    pending_debug_rows = []
+
+    progress_by_unit = {}
     cursor = 0
     success_streak = 0
+    group_index = 0
 
-    while cursor < len(pending_rows):
+    groups_since_flush = 0
+    units_since_flush = 0
+    last_flush_time = time.time()
+
+    while cursor < total_units:
         elapsed = time.time() - start_time
         if elapsed >= soft_time_limit_seconds:
+            log_progress(
+                step_name=step_config["name"],
+                group_index=group_index,
+                total_units=total_units,
+                processed_count=processed_count,
+                cursor=cursor,
+                current_group_size=current_group_size,
+                success_streak=success_streak,
+                progress_by_unit=progress_by_unit,
+                note="soft_time_limit_reached",
+                start_time=start_time,
+            )
             break
 
         group_units = pending_rows[cursor: cursor + current_group_size]
+        group_index += 1
+
+        if group_index % log_every_n_groups == 0:
+            log_progress(
+                step_name=step_config["name"],
+                group_index=group_index,
+                total_units=total_units,
+                processed_count=processed_count,
+                cursor=cursor,
+                current_group_size=current_group_size,
+                success_streak=success_streak,
+                progress_by_unit=progress_by_unit,
+                note=f"group_start size={len(group_units)}",
+                start_time=start_time,
+            )
 
         requests = task_handler.build_requests(group_units, step_config, prompt_context)
         if not requests:
             raise ValueError("Task handler returned no grouped requests")
 
-        # For this adaptive implementation, we expect one grouped request per group slice.
         if len(requests) != 1:
             raise ValueError(
                 "Adaptive grouped batching expects task_handler.build_requests(...) "
@@ -264,19 +119,40 @@ def process_batches(
                 last_exception = e
                 if attempt >= max_request_retries:
                     break
+
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} "
+                        f"request_retry={attempt + 1}/{max_request_retries} "
+                        f"group_size={current_group_size} "
+                        f"error={str(e)}"
+                    ),
+                    flush=True,
+                )
                 time.sleep(retry_backoff_seconds * (attempt + 1))
 
         if last_exception is not None:
-            # If grouped request totally failed, shrink and retry same units if possible
             if current_group_size > min_group_size:
-                current_group_size = _next_smaller_group_size(
+                new_group_size = next_smaller_group_size(
                     current_group_size, min_group_size, shrink_factor
                 )
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} "
+                        f"action=shrink_on_request_exception "
+                        f"old_group_size={current_group_size} "
+                        f"new_group_size={new_group_size} "
+                        f"error={str(last_exception)}"
+                    ),
+                    flush=True,
+                )
+                current_group_size = new_group_size
                 success_streak = 0
                 continue
 
-            # Already at minimum size; mark these units as retryable_error and move on
-            progress_rows, debug_rows = _mark_group_parse_failure(
+            progress_rows, debug_rows = mark_group_parse_failure(
                 group_units=group_units,
                 request=request,
                 raw_output=None,
@@ -284,39 +160,133 @@ def process_batches(
                 error_message=str(last_exception),
                 progress_df=progress_df,
             )
-            batch_progress_rows.extend(progress_rows)
-            batch_debug_rows.extend(debug_rows)
+
+            pending_progress_rows.extend(progress_rows)
+            pending_debug_rows.extend(debug_rows)
+            merge_progress_rows_in_memory(progress_by_unit, progress_rows)
+
             processed_count += len(group_units)
             cursor += len(group_units)
+            groups_since_flush += 1
+            units_since_flush += len(group_units)
             success_streak = 0
+
+            log_progress(
+                step_name=step_config["name"],
+                group_index=group_index,
+                total_units=total_units,
+                processed_count=processed_count,
+                cursor=cursor,
+                current_group_size=current_group_size,
+                success_streak=success_streak,
+                progress_by_unit=progress_by_unit,
+                note="marked_group_request_exception_at_min_group_size",
+                start_time=start_time,
+            )
+
+            if should_flush(
+                pending_progress_rows=pending_progress_rows,
+                pending_result_rows=pending_result_rows,
+                pending_debug_rows=pending_debug_rows,
+                groups_since_flush=groups_since_flush,
+                units_since_flush=units_since_flush,
+                last_flush_time=last_flush_time,
+                runtime=runtime,
+            ):
+                flush_buffers(
+                    flush_callback=flush_callback,
+                    pending_progress_rows=pending_progress_rows,
+                    pending_result_rows=pending_result_rows,
+                    pending_debug_rows=pending_debug_rows,
+                    processed_count=processed_count,
+                    remaining_units=max(total_units - cursor, 0),
+                    current_group_size=current_group_size,
+                    success_streak=success_streak,
+                )
+                groups_since_flush = 0
+                units_since_flush = 0
+                last_flush_time = time.time()
+
             continue
 
         request_result = adapter_results[0]
 
         if request_result["status"] != "success":
-            # Retryable provider failure: shrink and retry same slice if possible
             if request_result["status"] == "retryable_error" and current_group_size > min_group_size:
-                current_group_size = _next_smaller_group_size(
+                new_group_size = next_smaller_group_size(
                     current_group_size, min_group_size, shrink_factor
                 )
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} "
+                        f"action=shrink_on_transport_retryable "
+                        f"old_group_size={current_group_size} "
+                        f"new_group_size={new_group_size} "
+                        f"error_type={request_result.get('error_type')} "
+                        f"error_message={request_result.get('error_message')}"
+                    ),
+                    flush=True,
+                )
+                current_group_size = new_group_size
                 success_streak = 0
                 continue
 
-            # Otherwise mark each unit in group with same transport failure and move on
-            progress_rows, debug_rows = _mark_group_transport_failure(
+            progress_rows, debug_rows = mark_group_transport_failure(
                 group_units=group_units,
                 request=request,
                 request_result=request_result,
                 progress_df=progress_df,
             )
-            batch_progress_rows.extend(progress_rows)
-            batch_debug_rows.extend(debug_rows)
+
+            pending_progress_rows.extend(progress_rows)
+            pending_debug_rows.extend(debug_rows)
+            merge_progress_rows_in_memory(progress_by_unit, progress_rows)
+
             processed_count += len(group_units)
             cursor += len(group_units)
+            groups_since_flush += 1
+            units_since_flush += len(group_units)
             success_streak = 0
+
+            log_progress(
+                step_name=step_config["name"],
+                group_index=group_index,
+                total_units=total_units,
+                processed_count=processed_count,
+                cursor=cursor,
+                current_group_size=current_group_size,
+                success_streak=success_streak,
+                progress_by_unit=progress_by_unit,
+                note=f"transport_non_success status={request_result['status']}",
+                start_time=start_time,
+            )
+
+            if should_flush(
+                pending_progress_rows=pending_progress_rows,
+                pending_result_rows=pending_result_rows,
+                pending_debug_rows=pending_debug_rows,
+                groups_since_flush=groups_since_flush,
+                units_since_flush=units_since_flush,
+                last_flush_time=last_flush_time,
+                runtime=runtime,
+            ):
+                flush_buffers(
+                    flush_callback=flush_callback,
+                    pending_progress_rows=pending_progress_rows,
+                    pending_result_rows=pending_result_rows,
+                    pending_debug_rows=pending_debug_rows,
+                    processed_count=processed_count,
+                    remaining_units=max(total_units - cursor, 0),
+                    current_group_size=current_group_size,
+                    success_streak=success_streak,
+                )
+                groups_since_flush = 0
+                units_since_flush = 0
+                last_flush_time = time.time()
+
             continue
 
-        # Parse grouped response
         try:
             parse_results = task_handler.parse_grouped_result(
                 raw_output=request_result["raw_output"],
@@ -329,15 +299,26 @@ def process_batches(
             validate_grouped_parse_results(parse_results, expected_unit_ids)
 
         except Exception as e:
-            # If grouped parse fails, shrink and retry same slice if possible
             if current_group_size > min_group_size:
-                current_group_size = _next_smaller_group_size(
+                new_group_size = next_smaller_group_size(
                     current_group_size, min_group_size, shrink_factor
                 )
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} "
+                        f"action=shrink_on_parse_exception "
+                        f"old_group_size={current_group_size} "
+                        f"new_group_size={new_group_size} "
+                        f"error={str(e)}"
+                    ),
+                    flush=True,
+                )
+                current_group_size = new_group_size
                 success_streak = 0
                 continue
 
-            progress_rows, debug_rows = _mark_group_parse_failure(
+            progress_rows, debug_rows = mark_group_parse_failure(
                 group_units=group_units,
                 request=request,
                 raw_output=request_result.get("raw_output"),
@@ -345,14 +326,56 @@ def process_batches(
                 error_message=str(e),
                 progress_df=progress_df,
             )
-            batch_progress_rows.extend(progress_rows)
-            batch_debug_rows.extend(debug_rows)
+
+            pending_progress_rows.extend(progress_rows)
+            pending_debug_rows.extend(debug_rows)
+            merge_progress_rows_in_memory(progress_by_unit, progress_rows)
+
             processed_count += len(group_units)
             cursor += len(group_units)
+            groups_since_flush += 1
+            units_since_flush += len(group_units)
             success_streak = 0
+
+            log_progress(
+                step_name=step_config["name"],
+                group_index=group_index,
+                total_units=total_units,
+                processed_count=processed_count,
+                cursor=cursor,
+                current_group_size=current_group_size,
+                success_streak=success_streak,
+                progress_by_unit=progress_by_unit,
+                note="marked_group_parse_exception_at_min_group_size",
+                start_time=start_time,
+            )
+
+            if should_flush(
+                pending_progress_rows=pending_progress_rows,
+                pending_result_rows=pending_result_rows,
+                pending_debug_rows=pending_debug_rows,
+                groups_since_flush=groups_since_flush,
+                units_since_flush=units_since_flush,
+                last_flush_time=last_flush_time,
+                runtime=runtime,
+            ):
+                flush_buffers(
+                    flush_callback=flush_callback,
+                    pending_progress_rows=pending_progress_rows,
+                    pending_result_rows=pending_result_rows,
+                    pending_debug_rows=pending_debug_rows,
+                    processed_count=processed_count,
+                    remaining_units=max(total_units - cursor, 0),
+                    current_group_size=current_group_size,
+                    success_streak=success_streak,
+                )
+                groups_since_flush = 0
+                units_since_flush = 0
+                last_flush_time = time.time()
+
             continue
 
-        progress_rows, result_rows, debug_rows = _build_rows_from_group_parse(
+        progress_rows, result_rows, debug_rows = build_rows_from_group_parse(
             group_units=group_units,
             request=request,
             request_result=request_result,
@@ -360,40 +383,117 @@ def process_batches(
             progress_df=progress_df,
         )
 
-        batch_progress_rows.extend(progress_rows)
-        batch_result_rows.extend(result_rows)
-        batch_debug_rows.extend(debug_rows)
+        pending_progress_rows.extend(progress_rows)
+        pending_result_rows.extend(result_rows)
+        pending_debug_rows.extend(debug_rows)
+        merge_progress_rows_in_memory(progress_by_unit, progress_rows)
 
         processed_count += len(group_units)
         cursor += len(group_units)
+        groups_since_flush += 1
+        units_since_flush += len(group_units)
 
         all_success = all(row["status"] == "success" for row in parse_results)
 
         if all_success:
             success_streak += 1
             if success_streak >= grow_after_successes and current_group_size < max_group_size:
-                current_group_size = _next_larger_group_size(
+                new_group_size = next_larger_group_size(
                     current_group_size, max_group_size, grow_step
                 )
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} "
+                        f"action=grow "
+                        f"old_group_size={current_group_size} "
+                        f"new_group_size={new_group_size}"
+                    ),
+                    flush=True,
+                )
+                current_group_size = new_group_size
                 success_streak = 0
         else:
-            # any non-success means back off aggressively
             if current_group_size > min_group_size:
-                current_group_size = _next_smaller_group_size(
+                new_group_size = next_smaller_group_size(
                     current_group_size, min_group_size, shrink_factor
                 )
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} "
+                        f"action=shrink_on_partial_non_success "
+                        f"old_group_size={current_group_size} "
+                        f"new_group_size={new_group_size}"
+                    ),
+                    flush=True,
+                )
+                current_group_size = new_group_size
             success_streak = 0
 
-    remaining_units = max(len(pending_rows) - processed_count, 0)
+        log_progress(
+            step_name=step_config["name"],
+            group_index=group_index,
+            total_units=total_units,
+            processed_count=processed_count,
+            cursor=cursor,
+            current_group_size=current_group_size,
+            success_streak=success_streak,
+            progress_by_unit=progress_by_unit,
+            note="group_complete",
+            start_time=start_time,
+        )
+
+        if should_flush(
+            pending_progress_rows=pending_progress_rows,
+            pending_result_rows=pending_result_rows,
+            pending_debug_rows=pending_debug_rows,
+            groups_since_flush=groups_since_flush,
+            units_since_flush=units_since_flush,
+            last_flush_time=last_flush_time,
+            runtime=runtime,
+        ):
+            flush_buffers(
+                flush_callback=flush_callback,
+                pending_progress_rows=pending_progress_rows,
+                pending_result_rows=pending_result_rows,
+                pending_debug_rows=pending_debug_rows,
+                processed_count=processed_count,
+                remaining_units=max(total_units - cursor, 0),
+                current_group_size=current_group_size,
+                success_streak=success_streak,
+            )
+            groups_since_flush = 0
+            units_since_flush = 0
+            last_flush_time = time.time()
+
+    flush_buffers(
+        flush_callback=flush_callback,
+        pending_progress_rows=pending_progress_rows,
+        pending_result_rows=pending_result_rows,
+        pending_debug_rows=pending_debug_rows,
+        processed_count=processed_count,
+        remaining_units=max(total_units - cursor, 0),
+        current_group_size=current_group_size,
+        success_streak=success_streak,
+    )
+
+    remaining_units = max(total_units - processed_count, 0)
     outcome = LLMRunOutcome(
         status="complete" if remaining_units == 0 else "retryable_incomplete",
         processed_units=processed_count,
         remaining_units=remaining_units,
     )
 
-    return {
-        "outcome": outcome,
-        "progress_rows": batch_progress_rows,
-        "result_rows": batch_result_rows,
-        "debug_rows": batch_debug_rows,
-    }
+    print(
+        (
+            f"[llm:{step_config['name']}] "
+            f"run_end "
+            f"processed={processed_count}/{total_units} "
+            f"remaining={remaining_units} "
+            f"outcome={outcome.status}"
+        ),
+        flush=True,
+    )
+
+    return {"outcome": outcome}

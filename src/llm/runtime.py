@@ -14,6 +14,9 @@ def default_runtime(step_config: dict) -> dict:
         "grow_step": runtime.get("grow_step", 1),
         "shrink_factor": runtime.get("shrink_factor", 0.5),
         "flush_every_n_units": runtime.get("flush_every_n_units", 50),
+        "flush_every_n_groups": runtime.get("flush_every_n_groups", 1),
+        "flush_every_n_seconds": runtime.get("flush_every_n_seconds", 60),
+        "log_every_n_groups": runtime.get("log_every_n_groups", 1),
         "soft_time_limit_minutes": runtime.get("soft_time_limit_minutes", 40),
         "max_request_retries": runtime.get("max_request_retries", 3),
         "retry_backoff_seconds": runtime.get("retry_backoff_seconds", 10),
@@ -47,14 +50,59 @@ def validate_llm_step(step_config: dict):
                 f"LLM step input column '{col}' missing from output_columns mapping"
             )
 
+    runtime = default_runtime(step_config)
+
+    if runtime["initial_group_size"] < 1:
+        raise ValueError("LLM runtime 'initial_group_size' must be >= 1")
+
+    if runtime["min_group_size"] < 1:
+        raise ValueError("LLM runtime 'min_group_size' must be >= 1")
+
+    if runtime["max_group_size"] < runtime["min_group_size"]:
+        raise ValueError("LLM runtime 'max_group_size' must be >= 'min_group_size'")
+
+    if runtime["initial_group_size"] < runtime["min_group_size"]:
+        raise ValueError("LLM runtime 'initial_group_size' must be >= 'min_group_size'")
+
+    if runtime["initial_group_size"] > runtime["max_group_size"]:
+        raise ValueError("LLM runtime 'initial_group_size' must be <= 'max_group_size'")
+
+    if runtime["grow_after_successes"] < 1:
+        raise ValueError("LLM runtime 'grow_after_successes' must be >= 1")
+
+    if runtime["grow_step"] < 1:
+        raise ValueError("LLM runtime 'grow_step' must be >= 1")
+
+    if runtime["shrink_factor"] <= 0 or runtime["shrink_factor"] >= 1:
+        raise ValueError("LLM runtime 'shrink_factor' must be > 0 and < 1")
+
+    if runtime["flush_every_n_units"] < 1:
+        raise ValueError("LLM runtime 'flush_every_n_units' must be >= 1")
+
+    if runtime["flush_every_n_groups"] < 1:
+        raise ValueError("LLM runtime 'flush_every_n_groups' must be >= 1")
+
+    if runtime["flush_every_n_seconds"] < 1:
+        raise ValueError("LLM runtime 'flush_every_n_seconds' must be >= 1")
+
+    if runtime["log_every_n_groups"] < 1:
+        raise ValueError("LLM runtime 'log_every_n_groups' must be >= 1")
+
+    if runtime["soft_time_limit_minutes"] <= 0:
+        raise ValueError("LLM runtime 'soft_time_limit_minutes' must be > 0")
+
+    if runtime["max_request_retries"] < 0:
+        raise ValueError("LLM runtime 'max_request_retries' must be >= 0")
+
+    if runtime["retry_backoff_seconds"] < 0:
+        raise ValueError("LLM runtime 'retry_backoff_seconds' must be >= 0")
+
 
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
     if progress_df.is_empty():
         return set()
 
-    terminal = progress_df.filter(
-        pl.col("status").is_in(["success", "permanent_error"])
-    )
+    terminal = progress_df.filter(pl.col("status").is_in(["success", "permanent_error"]))
     return set(terminal["unit_id"].to_list())
 
 
