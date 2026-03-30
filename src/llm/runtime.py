@@ -6,29 +6,49 @@ from .state import utc_now_iso
 
 def default_runtime(step_config: dict) -> dict:
     runtime = step_config.get("runtime", {})
+    initial_concurrency = runtime.get("initial_concurrency", 1)
+    max_concurrent_requests = runtime.get("max_concurrent_requests", 4)
 
-    initial_group_size = runtime.get("initial_group_size", 400)
-    initial_concurrency = runtime.get("initial_concurrency", runtime.get("max_concurrent_requests", 1))
-    initial_load_budget = runtime.get("initial_load_budget", initial_group_size * initial_concurrency)
+    if initial_concurrency > max_concurrent_requests:
+        initial_concurrency = max_concurrent_requests
 
     return {
-        "initial_group_size": initial_group_size,
-        "min_group_size": runtime.get("min_group_size", 50),
-        "max_group_size": runtime.get("max_group_size", 4000),
-        "initial_concurrency": initial_concurrency,
-        "min_concurrency": runtime.get("min_concurrency", 1),
-        "max_concurrent_requests": runtime.get("max_concurrent_requests", 1),
-        "initial_load_budget": initial_load_budget,
-        "load_growth_factor": runtime.get("load_growth_factor", 1.35),
-        "load_shrink_factor": runtime.get("load_shrink_factor", 0.60),
-        "mild_load_shrink_factor": runtime.get("mild_load_shrink_factor", 0.85),
-        "concurrency_growth_cooldown_waves": runtime.get("concurrency_growth_cooldown_waves", 2),
-        "concurrency_shrink_cooldown_waves": runtime.get("concurrency_shrink_cooldown_waves", 1),
+        "initial_group_size": runtime.get("initial_group_size", 4),
+        "min_group_size": runtime.get("min_group_size", 1),
+        "max_group_size": runtime.get("max_group_size", 16),
+        "grow_after_successes": runtime.get("grow_after_successes", 2),
+        "grow_step": runtime.get("grow_step", 1),
+
+        # kept for compatibility with earlier controller versions
+        "shrink_factor": runtime.get("shrink_factor", 0.75),
+        "mild_shrink_factor": runtime.get("mild_shrink_factor", 0.90),
+
+        # throughput / failure-rate controller
         "soft_failure_rate": runtime.get("soft_failure_rate", 0.02),
         "hard_failure_rate": runtime.get("hard_failure_rate", 0.10),
         "throughput_tolerance": runtime.get("throughput_tolerance", 0.05),
         "throughput_ema_alpha": runtime.get("throughput_ema_alpha", 0.30),
-        "flush_every_n_units": runtime.get("flush_every_n_units", 500),
+
+        # tandem load controller
+        "initial_concurrency": initial_concurrency,
+        "min_concurrency": runtime.get("min_concurrency", 1),
+        "max_concurrent_requests": max_concurrent_requests,
+        "initial_load_budget": runtime.get(
+            "initial_load_budget",
+            runtime.get("initial_group_size", 4) * initial_concurrency,
+        ),
+        "load_growth_factor": runtime.get("load_growth_factor", 1.35),
+        "load_shrink_factor": runtime.get("load_shrink_factor", 0.60),
+        "mild_load_shrink_factor": runtime.get("mild_load_shrink_factor", 0.85),
+        "concurrency_growth_cooldown_waves": runtime.get(
+            "concurrency_growth_cooldown_waves", 2
+        ),
+        "concurrency_shrink_cooldown_waves": runtime.get(
+            "concurrency_shrink_cooldown_waves", 1
+        ),
+
+        # flushing / logging / timing
+        "flush_every_n_units": runtime.get("flush_every_n_units", 50),
         "flush_every_n_groups": runtime.get("flush_every_n_groups", 1),
         "flush_every_n_seconds": runtime.get("flush_every_n_seconds", 60),
         "max_flushes_per_run": runtime.get("max_flushes_per_run"),
@@ -36,9 +56,13 @@ def default_runtime(step_config: dict) -> dict:
         "soft_time_limit_minutes": runtime.get("soft_time_limit_minutes", 40),
         "max_request_retries": runtime.get("max_request_retries", 3),
         "retry_backoff_seconds": runtime.get("retry_backoff_seconds", 10),
+
+        # release / artifacts
         "flush_scope": runtime.get("flush_scope", "unit"),
         "write_partial_merged_output": runtime.get("write_partial_merged_output", False),
         "write_pair_status": runtime.get("write_pair_status", False),
+
+        # subset-window testing
         "input_row_limit": runtime.get("input_row_limit"),
         "input_row_offset": runtime.get("input_row_offset", 0),
     }
@@ -79,80 +103,111 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'min_group_size' must be >= 1")
     if runtime["max_group_size"] < runtime["min_group_size"]:
         raise ValueError("LLM runtime 'max_group_size' must be >= 'min_group_size'")
+    if runtime["initial_group_size"] < runtime["min_group_size"]:
+        raise ValueError("LLM runtime 'initial_group_size' must be >= 'min_group_size'")
     if runtime["initial_group_size"] > runtime["max_group_size"]:
         raise ValueError("LLM runtime 'initial_group_size' must be <= 'max_group_size'")
 
-    if runtime["min_concurrency"] < 1:
-        raise ValueError("LLM runtime 'min_concurrency' must be >= 1")
-    if runtime["max_concurrent_requests"] < runtime["min_concurrency"]:
-        raise ValueError("LLM runtime 'max_concurrent_requests' must be >= 'min_concurrency'")
-    if runtime["initial_concurrency"] < runtime["min_concurrency"]:
-        raise ValueError("LLM runtime 'initial_concurrency' must be >= 'min_concurrency'")
-    if runtime["initial_concurrency"] > runtime["max_concurrent_requests"]:
-        raise ValueError("LLM runtime 'initial_concurrency' must be <= 'max_concurrent_requests'")
-    if runtime["max_concurrent_requests"] >= 8:
-        raise ValueError("LLM runtime 'max_concurrent_requests' must stay below 8")
+    if runtime["grow_after_successes"] < 1:
+        raise ValueError("LLM runtime 'grow_after_successes' must be >= 1")
+    if runtime["grow_step"] < 1:
+        raise ValueError("LLM runtime 'grow_step' must be >= 1")
 
-    if runtime["initial_load_budget"] < runtime["min_group_size"] * runtime["min_concurrency"]:
-        raise ValueError("LLM runtime 'initial_load_budget' is below the minimum feasible load budget")
-
-    for name in [
-        "load_growth_factor",
-        "load_shrink_factor",
-        "mild_load_shrink_factor",
-    ]:
-        if runtime[name] <= 0:
-            raise ValueError(f"LLM runtime '{name}' must be > 0")
-
-    if runtime["load_growth_factor"] <= 1:
-        raise ValueError("LLM runtime 'load_growth_factor' must be > 1")
-    if runtime["load_shrink_factor"] >= 1:
-        raise ValueError("LLM runtime 'load_shrink_factor' must be < 1")
-    if runtime["mild_load_shrink_factor"] >= 1:
-        raise ValueError("LLM runtime 'mild_load_shrink_factor' must be < 1")
+    if runtime["shrink_factor"] <= 0 or runtime["shrink_factor"] >= 1:
+        raise ValueError("LLM runtime 'shrink_factor' must be > 0 and < 1")
+    if runtime["mild_shrink_factor"] <= 0 or runtime["mild_shrink_factor"] >= 1:
+        raise ValueError("LLM runtime 'mild_shrink_factor' must be > 0 and < 1")
 
     if runtime["soft_failure_rate"] < 0 or runtime["soft_failure_rate"] > 1:
         raise ValueError("LLM runtime 'soft_failure_rate' must be between 0 and 1")
     if runtime["hard_failure_rate"] < 0 or runtime["hard_failure_rate"] > 1:
         raise ValueError("LLM runtime 'hard_failure_rate' must be between 0 and 1")
-    if runtime["hard_failure_rate"] < runtime["soft_failure_rate"]:
-        raise ValueError("LLM runtime 'hard_failure_rate' must be >= 'soft_failure_rate'")
+    if runtime["soft_failure_rate"] > runtime["hard_failure_rate"]:
+        raise ValueError("LLM runtime 'soft_failure_rate' must be <= 'hard_failure_rate'")
+
     if runtime["throughput_tolerance"] < 0:
         raise ValueError("LLM runtime 'throughput_tolerance' must be >= 0")
     if runtime["throughput_ema_alpha"] <= 0 or runtime["throughput_ema_alpha"] > 1:
         raise ValueError("LLM runtime 'throughput_ema_alpha' must be > 0 and <= 1")
 
-    for name in [
-        "concurrency_growth_cooldown_waves",
-        "concurrency_shrink_cooldown_waves",
-        "flush_every_n_units",
-        "flush_every_n_groups",
-        "flush_every_n_seconds",
-        "log_every_n_groups",
-    ]:
-        if runtime[name] < 1:
-            raise ValueError(f"LLM runtime '{name}' must be >= 1")
+    if runtime["initial_concurrency"] < 1:
+        raise ValueError("LLM runtime 'initial_concurrency' must be >= 1")
+    if runtime["min_concurrency"] < 1:
+        raise ValueError("LLM runtime 'min_concurrency' must be >= 1")
+    if runtime["max_concurrent_requests"] < 1:
+        raise ValueError("LLM runtime 'max_concurrent_requests' must be >= 1")
 
-    if runtime["max_flushes_per_run"] is not None and runtime["max_flushes_per_run"] < 1:
-        raise ValueError("LLM runtime 'max_flushes_per_run' must be >= 1 or omitted")
+    # keep safely under the Google 8-concurrent failure zone you saw
+    if runtime["max_concurrent_requests"] > 7:
+        raise ValueError("LLM runtime 'max_concurrent_requests' must be <= 7")
 
+    if runtime["initial_concurrency"] > runtime["max_concurrent_requests"]:
+        raise ValueError(
+            "LLM runtime 'initial_concurrency' must be <= 'max_concurrent_requests'"
+        )
+    if runtime["min_concurrency"] > runtime["max_concurrent_requests"]:
+        raise ValueError(
+            "LLM runtime 'min_concurrency' must be <= 'max_concurrent_requests'"
+        )
+
+    if runtime["initial_load_budget"] < 1:
+        raise ValueError("LLM runtime 'initial_load_budget' must be >= 1")
+    if runtime["load_growth_factor"] <= 1:
+        raise ValueError("LLM runtime 'load_growth_factor' must be > 1")
+    if runtime["load_shrink_factor"] <= 0 or runtime["load_shrink_factor"] >= 1:
+        raise ValueError("LLM runtime 'load_shrink_factor' must be > 0 and < 1")
+    if runtime["mild_load_shrink_factor"] <= 0 or runtime["mild_load_shrink_factor"] >= 1:
+        raise ValueError("LLM runtime 'mild_load_shrink_factor' must be > 0 and < 1")
+
+    if runtime["concurrency_growth_cooldown_waves"] < 1:
+        raise ValueError("LLM runtime 'concurrency_growth_cooldown_waves' must be >= 1")
+    if runtime["concurrency_shrink_cooldown_waves"] < 1:
+        raise ValueError("LLM runtime 'concurrency_shrink_cooldown_waves' must be >= 1")
+
+    if runtime["flush_every_n_units"] < 1:
+        raise ValueError("LLM runtime 'flush_every_n_units' must be >= 1")
+    if runtime["flush_every_n_groups"] < 1:
+        raise ValueError("LLM runtime 'flush_every_n_groups' must be >= 1")
+    if runtime["flush_every_n_seconds"] < 1:
+        raise ValueError("LLM runtime 'flush_every_n_seconds' must be >= 1")
+    if runtime["log_every_n_groups"] < 1:
+        raise ValueError("LLM runtime 'log_every_n_groups' must be >= 1")
     if runtime["soft_time_limit_minutes"] <= 0:
         raise ValueError("LLM runtime 'soft_time_limit_minutes' must be > 0")
     if runtime["max_request_retries"] < 0:
         raise ValueError("LLM runtime 'max_request_retries' must be >= 0")
     if runtime["retry_backoff_seconds"] < 0:
         raise ValueError("LLM runtime 'retry_backoff_seconds' must be >= 0")
+
     if runtime["flush_scope"] not in {"unit", "row_complete"}:
         raise ValueError("LLM runtime 'flush_scope' must be 'unit' or 'row_complete'")
+
     if runtime["input_row_limit"] is not None and runtime["input_row_limit"] < 1:
-        raise ValueError("LLM runtime 'input_row_limit' must be >= 1 if provided")
+        raise ValueError("LLM runtime 'input_row_limit' must be >= 1 when provided")
     if runtime["input_row_offset"] < 0:
         raise ValueError("LLM runtime 'input_row_offset' must be >= 0")
+
+
+def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFrame:
+    """
+    Optional subset-windowing for testing on part of a full dataset without
+    changing the source file itself.
+    """
+    offset = runtime.get("input_row_offset", 0) or 0
+    limit = runtime.get("input_row_limit")
+
+    if limit is None:
+        if offset == 0:
+            return source_df
+        return source_df.slice(offset)
+
+    return source_df.slice(offset, limit)
 
 
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
     if progress_df.is_empty():
         return set()
+
     terminal = progress_df.filter(pl.col("status").is_in(["success", "permanent_error"]))
     return set(terminal["unit_id"].to_list())
 
