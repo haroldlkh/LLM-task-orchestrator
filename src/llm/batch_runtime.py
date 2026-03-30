@@ -1,17 +1,35 @@
+from dataclasses import dataclass
 import math
 import time
-from typing import Dict, List, Optional
 
 
-def next_smaller_group_size(current_size: int, min_size: int, shrink_factor: float) -> int:
-    shrunk = max(min_size, int(math.floor(current_size * shrink_factor)))
-    if shrunk == current_size and current_size > min_size:
-        shrunk = current_size - 1
-    return max(min_size, shrunk)
+@dataclass
+class ControllerState:
+    load_budget: float
+    concurrency: int
+    throughput_ema: float | None = None
+    good_wave_streak: int = 0
+    bad_wave_streak: int = 0
+    waves_since_concurrency_change: int = 0
 
 
-def next_larger_group_size(current_size: int, max_size: int, grow_step: int) -> int:
-    return min(max_size, current_size + grow_step)
+def clamp(value: int | float, low: int | float, high: int | float):
+    return max(low, min(high, value))
+
+
+def derive_group_size(load_budget: float, concurrency: int, min_group_size: int, max_group_size: int) -> int:
+    raw = int(round(load_budget / max(concurrency, 1)))
+    return int(clamp(raw, min_group_size, max_group_size))
+
+
+def effective_load(group_size: int, concurrency: int) -> int:
+    return group_size * concurrency
+
+
+def update_ema(previous: float | None, value: float, alpha: float) -> float:
+    if previous is None:
+        return value
+    return alpha * value + (1 - alpha) * previous
 
 
 def merge_progress_rows_in_memory(progress_by_unit: dict, new_rows) -> None:
@@ -20,11 +38,7 @@ def merge_progress_rows_in_memory(progress_by_unit: dict, new_rows) -> None:
 
 
 def status_counts_from_progress_map(progress_by_unit: dict) -> dict:
-    counts = {
-        "success": 0,
-        "retryable_error": 0,
-        "permanent_error": 0,
-    }
+    counts = {"success": 0, "retryable_error": 0, "permanent_error": 0}
     for row in progress_by_unit.values():
         status = row.get("status")
         if status in counts:
@@ -38,48 +52,37 @@ def elapsed_seconds(start_time: float) -> int:
 
 def log_progress(
     step_name: str,
-    group_index: int,
+    wave_index: int,
     total_units: int,
     processed_count: int,
     cursor: int,
     current_group_size: int,
+    current_concurrency: int,
+    current_load_budget: float,
     success_streak: int,
     progress_by_unit: dict,
     note: str,
     start_time: float,
-    request_seconds: Optional[float] = None,
-    useful_work_count: Optional[int] = None,
-    failure_rate: Optional[float] = None,
-    score: Optional[float] = None,
 ) -> None:
     counts = status_counts_from_progress_map(progress_by_unit)
     elapsed = elapsed_seconds(start_time)
     remaining = max(total_units - cursor, 0)
 
-    extra = []
-    if request_seconds is not None:
-        extra.append(f"request_s={request_seconds:.2f}")
-    if useful_work_count is not None:
-        extra.append(f"useful_work={useful_work_count}")
-    if failure_rate is not None:
-        extra.append(f"failure_rate={failure_rate:.4f}")
-    if score is not None:
-        extra.append(f"score={score:.4f}")
-    extra_str = (" " + " ".join(extra)) if extra else ""
-
     print(
         (
             f"[llm:{step_name}] "
-            f"groups={group_index} "
+            f"waves={wave_index} "
             f"processed={processed_count}/{total_units} "
             f"cursor={cursor} "
             f"remaining={remaining} "
             f"group_size={current_group_size} "
+            f"concurrency={current_concurrency} "
+            f"load_budget={int(current_load_budget)} "
             f"success_streak={success_streak} "
             f"success={counts['success']} "
             f"retryable_error={counts['retryable_error']} "
             f"permanent_error={counts['permanent_error']} "
-            f"elapsed_s={elapsed}{extra_str} "
+            f"elapsed_s={elapsed} "
             f"note={note}"
         ),
         flush=True,
@@ -98,6 +101,7 @@ def should_flush(
     has_pending = bool(pending_progress_rows or pending_result_rows or pending_debug_rows)
     if not has_pending:
         return False
+
     if units_since_flush >= runtime["flush_every_n_units"]:
         return True
     if groups_since_flush >= runtime["flush_every_n_groups"]:
@@ -115,12 +119,13 @@ def flush_buffers(
     processed_count: int,
     remaining_units: int,
     current_group_size: int,
-    success_streak: int,
-):
+    current_concurrency: int,
+    current_load_budget: float,
+) -> None:
     if not pending_progress_rows and not pending_result_rows and not pending_debug_rows:
-        return {"released_success_rows": 0, "counted_flush": False}
+        return
 
-    out = flush_callback(
+    flush_callback(
         {
             "progress_rows": list(pending_progress_rows),
             "result_rows": list(pending_result_rows),
@@ -128,172 +133,130 @@ def flush_buffers(
             "processed_units": processed_count,
             "remaining_units": remaining_units,
             "current_group_size": current_group_size,
-            "success_streak": success_streak,
+            "current_concurrency": current_concurrency,
+            "current_load_budget": int(current_load_budget),
         }
     )
 
     pending_progress_rows.clear()
     pending_result_rows.clear()
     pending_debug_rows.clear()
-    return out or {"released_success_rows": 0, "counted_flush": False}
 
 
-def useful_work_count_for_group(
-    group_units: List[Dict],
-    parse_results: List[Dict],
-    flush_scope: str,
-) -> int:
-    if not parse_results:
-        return 0
-
-    success_by_unit = {
-        row["unit_id"]: row["status"] == "success"
-        for row in parse_results
-    }
-
-    if flush_scope == "unit":
-        return sum(1 for row in parse_results if row["status"] == "success")
-
-    expected_per_row: Dict[str, int] = {}
-    success_per_row: Dict[str, int] = {}
-
-    for unit in group_units:
-        row_id = unit["row_id"]
-        expected_per_row[row_id] = expected_per_row.get(row_id, 0) + 1
-        if success_by_unit.get(unit["unit_id"], False):
-            success_per_row[row_id] = success_per_row.get(row_id, 0) + 1
-
-    complete_row_ids = {
-        row_id
-        for row_id, expected in expected_per_row.items()
-        if success_per_row.get(row_id, 0) == expected
-    }
-
-    return sum(1 for unit in group_units if unit["row_id"] in complete_row_ids and success_by_unit.get(unit["unit_id"], False))
+def request_score(useful_work: int, request_seconds: float) -> float:
+    if request_seconds <= 0:
+        return 0.0
+    return useful_work / request_seconds
 
 
-def init_controller_state() -> dict:
-    return {
-        "best_score": 0.0,
-        "last_growth_attempt_size": None,
-        "size_stats": {},
-    }
-
-
-def _update_ema(current: Optional[float], new_value: float, alpha: float) -> float:
-    if current is None:
-        return new_value
-    return (alpha * new_value) + ((1 - alpha) * current)
-
-
-def decide_next_group_size(
-    *,
-    current_group_size: int,
-    min_group_size: int,
-    max_group_size: int,
+def choose_next_controller_state(
+    controller: ControllerState,
     runtime: dict,
-    controller_state: dict,
-    useful_work_count: int,
-    total_units: int,
-    failed_units: int,
-    request_seconds: float,
-    transport_failure: bool,
-    whole_group_parse_failure: bool,
-    success_streak: int,
-) -> dict:
-    soft_failure_rate = runtime["soft_failure_rate"]
-    hard_failure_rate = runtime["hard_failure_rate"]
-    tolerance = runtime["throughput_tolerance"]
-    alpha = runtime["throughput_ema_alpha"]
+    group_size_used: int,
+    wave_metrics: dict,
+) -> tuple[ControllerState, list[str]]:
+    notes = []
 
-    failure_rate = (failed_units / total_units) if total_units else 0.0
-    score = (useful_work_count / request_seconds) if request_seconds > 0 else 0.0
+    load_budget = float(controller.load_budget)
+    concurrency = int(controller.concurrency)
+    throughput_ema = controller.throughput_ema
+    good_wave_streak = controller.good_wave_streak
+    bad_wave_streak = controller.bad_wave_streak
+    waves_since_concurrency_change = controller.waves_since_concurrency_change + 1
 
-    stats = controller_state["size_stats"].setdefault(
-        current_group_size,
-        {"score_ema": None, "failure_rate_ema": None, "samples": 0},
+    processed_units = max(wave_metrics["processed_units"], 1)
+    transport_failures = wave_metrics["transport_failures"]
+    successful_requests = wave_metrics["successful_requests"]
+    total_requests = max(wave_metrics["total_requests"], 1)
+    failure_rate = wave_metrics["failure_units"] / processed_units
+    wave_score = wave_metrics["useful_work"] / max(wave_metrics["elapsed_request_seconds"], 1e-9)
+    throughput_ema = update_ema(throughput_ema, wave_score, runtime["throughput_ema_alpha"])
+
+    mixed_transport_pressure = transport_failures > 0 and successful_requests > 0
+    all_transport_failure = transport_failures == total_requests
+
+    min_load_budget = runtime["min_group_size"] * runtime["min_concurrency"]
+    max_load_budget = runtime["max_group_size"] * runtime["max_concurrent_requests"]
+
+    if all_transport_failure:
+        load_budget *= runtime["load_shrink_factor"]
+        if concurrency > runtime["min_concurrency"] and waves_since_concurrency_change >= runtime["concurrency_shrink_cooldown_waves"]:
+            concurrency -= 1
+            waves_since_concurrency_change = 0
+            notes.append("concurrency_down_all_transport_failure")
+        notes.append("load_budget_down_all_transport_failure")
+        good_wave_streak = 0
+        bad_wave_streak += 1
+    elif mixed_transport_pressure:
+        if concurrency > runtime["min_concurrency"] and waves_since_concurrency_change >= runtime["concurrency_shrink_cooldown_waves"]:
+            concurrency -= 1
+            waves_since_concurrency_change = 0
+            notes.append("concurrency_down_mixed_transport_pressure")
+        else:
+            load_budget *= runtime["mild_load_shrink_factor"]
+            notes.append("load_budget_mild_down_mixed_transport_pressure")
+        good_wave_streak = 0
+        bad_wave_streak += 1
+    elif failure_rate >= runtime["hard_failure_rate"]:
+        load_budget *= runtime["load_shrink_factor"]
+        notes.append("load_budget_down_hard_failure_rate")
+        good_wave_streak = 0
+        bad_wave_streak += 1
+    elif failure_rate >= runtime["soft_failure_rate"]:
+        load_budget *= runtime["mild_load_shrink_factor"]
+        notes.append("load_budget_mild_down_soft_failure_rate")
+        good_wave_streak = 0
+        bad_wave_streak += 1
+    else:
+        good_wave_streak += 1
+        bad_wave_streak = 0
+
+        improving = throughput_ema is None or wave_score >= throughput_ema * (1 - runtime["throughput_tolerance"])
+        if improving:
+            load_budget *= runtime["load_growth_factor"]
+            notes.append("load_budget_up_improving_throughput")
+
+            if (
+                good_wave_streak >= runtime["concurrency_growth_cooldown_waves"]
+                and concurrency < runtime["max_concurrent_requests"]
+                and waves_since_concurrency_change >= runtime["concurrency_growth_cooldown_waves"]
+            ):
+                concurrency += 1
+                waves_since_concurrency_change = 0
+                notes.append("concurrency_up_sustained_good_waves")
+        else:
+            load_budget *= runtime["mild_load_shrink_factor"]
+            notes.append("load_budget_mild_down_non_improving_throughput")
+
+    load_budget = clamp(load_budget, min_load_budget, max_load_budget)
+
+    next_group_size = derive_group_size(
+        load_budget=load_budget,
+        concurrency=concurrency,
+        min_group_size=runtime["min_group_size"],
+        max_group_size=runtime["max_group_size"],
     )
-    stats["score_ema"] = _update_ema(stats["score_ema"], score, alpha)
-    stats["failure_rate_ema"] = _update_ema(stats["failure_rate_ema"], failure_rate, alpha)
-    stats["samples"] += 1
 
-    current_score_ema = stats["score_ema"]
-    controller_state["best_score"] = max(controller_state["best_score"], current_score_ema)
-    best_score = controller_state["best_score"]
+    # If clamped group size would force too much idle concurrency, compress concurrency down.
+    max_useful_concurrency = max(int(math.floor(load_budget / runtime["min_group_size"])), 1)
+    if concurrency > max_useful_concurrency:
+        concurrency = max(runtime["min_concurrency"], max_useful_concurrency)
+        next_group_size = derive_group_size(
+            load_budget=load_budget,
+            concurrency=concurrency,
+            min_group_size=runtime["min_group_size"],
+            max_group_size=runtime["max_group_size"],
+        )
+        notes.append("concurrency_down_to_match_load_budget")
 
-    action = "hold"
-    note = "throughput_hold"
-    new_group_size = current_group_size
-    new_success_streak = 0 if failed_units > 0 else success_streak
-
-    if transport_failure or whole_group_parse_failure:
-        action = "shrink_aggressive"
-        note = "transport_or_group_parse_failure"
-        new_group_size = next_smaller_group_size(current_group_size, min_group_size, runtime["shrink_factor"])
-        controller_state["last_growth_attempt_size"] = None
-        return {
-            "action": action,
-            "note": note,
-            "new_group_size": new_group_size,
-            "new_success_streak": 0,
-            "score": score,
-            "failure_rate": failure_rate,
-            "score_ema": current_score_ema,
-        }
-
-    if failure_rate >= hard_failure_rate:
-        action = "shrink_aggressive"
-        note = "hard_failure_rate_exceeded"
-        new_group_size = next_smaller_group_size(current_group_size, min_group_size, runtime["shrink_factor"])
-        controller_state["last_growth_attempt_size"] = None
-        return {
-            "action": action,
-            "note": note,
-            "new_group_size": new_group_size,
-            "new_success_streak": 0,
-            "score": score,
-            "failure_rate": failure_rate,
-            "score_ema": current_score_ema,
-        }
-
-    if failure_rate > soft_failure_rate:
-        note = "soft_failure_rate_tolerated"
-        return {
-            "action": action,
-            "note": note,
-            "new_group_size": new_group_size,
-            "new_success_streak": 0,
-            "score": score,
-            "failure_rate": failure_rate,
-            "score_ema": current_score_ema,
-        }
-
-    new_success_streak = success_streak + 1
-
-    near_best = best_score == 0 or current_score_ema >= (best_score * (1 - tolerance))
-    if near_best and new_success_streak >= runtime["grow_after_successes"] and current_group_size < max_group_size:
-        action = "grow"
-        note = "throughput_near_best_grow"
-        new_group_size = next_larger_group_size(current_group_size, max_group_size, runtime["grow_step"])
-        controller_state["last_growth_attempt_size"] = new_group_size
-        new_success_streak = 0
-    elif (
-        controller_state.get("last_growth_attempt_size") == current_group_size
-        and current_score_ema < (best_score * (1 - tolerance))
-        and current_group_size > min_group_size
-    ):
-        action = "shrink_mild"
-        note = "growth_overshot_best_throughput"
-        new_group_size = next_smaller_group_size(current_group_size, min_group_size, runtime["mild_shrink_factor"])
-        controller_state["last_growth_attempt_size"] = None
-        new_success_streak = 0
-
-    return {
-        "action": action,
-        "note": note,
-        "new_group_size": new_group_size,
-        "new_success_streak": new_success_streak,
-        "score": score,
-        "failure_rate": failure_rate,
-        "score_ema": current_score_ema,
-    }
+    return (
+        ControllerState(
+            load_budget=load_budget,
+            concurrency=concurrency,
+            throughput_ema=throughput_ema,
+            good_wave_streak=good_wave_streak,
+            bad_wave_streak=bad_wave_streak,
+            waves_since_concurrency_change=waves_since_concurrency_change,
+        ),
+        notes,
+    )
