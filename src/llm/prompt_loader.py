@@ -26,17 +26,6 @@ def _resolve_paths(repo_root: str, paths: List[str]) -> List[str]:
 
 
 def load_prompt_context(step_config: Dict) -> Dict:
-    """
-    Expected optional step_config["prompt"] structure:
-    {
-        "template_file": "prompts/contextual_anchoring/prompt.txt",
-        "schema_file": "prompts/contextual_anchoring/schema.json",
-        "notes_files": [
-            "prompts/contextual_anchoring/rubric.txt",
-            "prompts/contextual_anchoring/format.txt"
-        ]
-    }
-    """
     prompt_cfg = step_config.get("prompt", {})
     if not prompt_cfg:
         return {

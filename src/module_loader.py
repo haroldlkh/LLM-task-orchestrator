@@ -98,6 +98,7 @@ def validate_pipeline_config(pipeline_module, pipeline_path: str):
             required = [
                 "name",
                 "adapter",
+                "task_handler",
                 "provider_config_key",
                 "model",
                 "row_id_column",

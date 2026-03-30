@@ -3,18 +3,25 @@ from typing import Dict, List
 from .models import VALID_UNIT_STATUSES
 
 
-REQUIRED_RESULT_KEYS = {
+ADAPTER_RESULT_KEYS = {
     "unit_id",
     "status",
-    "parsed_output",
     "raw_output",
+    "error_type",
+    "error_message",
+}
+
+TASK_PARSE_RESULT_KEYS = {
+    "status",
+    "parsed_output",
+    "output_value",
     "error_type",
     "error_message",
 }
 
 
 def validate_adapter_result(result: Dict) -> None:
-    missing = REQUIRED_RESULT_KEYS - set(result.keys())
+    missing = ADAPTER_RESULT_KEYS - set(result.keys())
     if missing:
         raise ValueError(f"Adapter result missing keys: {sorted(missing)}")
 
@@ -45,3 +52,16 @@ def validate_adapter_batch_results(
         if unit_id in seen:
             raise ValueError(f"Adapter returned duplicate unit_id '{unit_id}'")
         seen.add(unit_id)
+
+
+def validate_task_parse_result(result: Dict) -> None:
+    missing = TASK_PARSE_RESULT_KEYS - set(result.keys())
+    if missing:
+        raise ValueError(f"Task parse result missing keys: {sorted(missing)}")
+
+    status = result["status"]
+    if status not in VALID_UNIT_STATUSES:
+        raise ValueError(
+            f"Invalid task parse result status '{status}'. "
+            f"Expected one of {sorted(VALID_UNIT_STATUSES)}"
+        )

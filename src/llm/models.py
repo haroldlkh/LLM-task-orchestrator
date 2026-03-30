@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 VALID_UNIT_STATUSES = {
@@ -42,6 +42,7 @@ class LLMResultRecord:
     output_column: str
     status: str
     parsed_output: Optional[str] = None
+    output_value: Any = None
     raw_output: Optional[str] = None
     error_type: Optional[str] = None
     error_message: Optional[str] = None
@@ -53,6 +54,7 @@ class LLMResultRecord:
             "output_column": self.output_column,
             "status": self.status,
             "parsed_output": self.parsed_output,
+            "output_value": self.output_value,
             "raw_output": self.raw_output,
             "error_type": self.error_type,
             "error_message": self.error_message,

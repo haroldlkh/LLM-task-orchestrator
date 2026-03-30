@@ -16,7 +16,11 @@ from .state import (
     upload_versioned_parquet,
     utc_now_iso,
 )
-from .validators import validate_adapter_batch_results
+from .task_loader import build_task_handler
+from .validators import (
+    validate_adapter_batch_results,
+    validate_task_parse_result,
+)
 
 
 def _hash_unit_id(parts: List[str]) -> str:
@@ -39,6 +43,7 @@ def _validate_llm_step(step_config: dict):
     required = [
         "name",
         "adapter",
+        "task_handler",
         "provider_config_key",
         "model",
         "row_id_column",
@@ -158,6 +163,7 @@ def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.
                 "output_column": pl.Utf8,
                 "status": pl.Utf8,
                 "parsed_output": pl.Utf8,
+                "output_value": pl.Utf8,
                 "raw_output": pl.Utf8,
                 "error_type": pl.Utf8,
                 "error_message": pl.Utf8,
@@ -224,6 +230,7 @@ def _result_rows_to_df(rows: List[dict]) -> pl.DataFrame:
                 "output_column": pl.Utf8,
                 "status": pl.Utf8,
                 "parsed_output": pl.Utf8,
+                "output_value": pl.Utf8,
                 "raw_output": pl.Utf8,
                 "error_type": pl.Utf8,
                 "error_message": pl.Utf8,
@@ -301,11 +308,11 @@ def _merge_results_back(source_df: pl.DataFrame, all_results_df: pl.DataFrame, r
 
     wide = (
         success_df
-        .select(["row_id", "output_column", "parsed_output"])
+        .select(["row_id", "output_column", "output_value"])
         .pivot(
             index="row_id",
             on="output_column",
-            values="parsed_output",
+            values="output_value",
             aggregate_function="first",
         )
         .rename({"row_id": row_id_column})
@@ -346,6 +353,7 @@ def execute_llm_step(
 
     provider_config = user_runtime_config[provider_config_key]
     adapter = build_adapter(step_config["adapter"], provider_config)
+    task_handler = build_task_handler(step_config["task_handler"])
     prompt_context = load_prompt_context(step_config)
 
     folders = ensure_llm_state_layout(
@@ -420,12 +428,14 @@ def execute_llm_step(
         batch = pending_rows[batch_start: batch_start + batch_size]
         expected_unit_ids = [unit["unit_id"] for unit in batch]
 
+        requests = task_handler.build_requests(batch, step_config, prompt_context)
+
         last_exception = None
         adapter_results = None
 
         for attempt in range(max_request_retries + 1):
             try:
-                adapter_results = adapter.execute_batch(batch, step_config, prompt_context)
+                adapter_results = adapter.execute_batch(requests, step_config)
                 validate_adapter_batch_results(adapter_results, expected_unit_ids)
                 last_exception = None
                 break
@@ -452,40 +462,67 @@ def execute_llm_step(
             processed_count += len(batch)
         else:
             now = utc_now_iso()
-            for result in adapter_results:
-                unit = next(u for u in batch if u["unit_id"] == result["unit_id"])
-                status = result["status"]
 
-                retry_count = _current_retry_count(progress_df, result["unit_id"])
-                if status == "retryable_error":
+            for adapter_result in adapter_results:
+                unit = next(u for u in batch if u["unit_id"] == adapter_result["unit_id"])
+                transport_status = adapter_result["status"]
+
+                if transport_status != "success":
+                    retry_count = _current_retry_count(progress_df, adapter_result["unit_id"])
+                    if transport_status == "retryable_error":
+                        retry_count += 1
+
+                    batch_progress_rows.append(
+                        LLMProgressRecord(
+                            unit_id=adapter_result["unit_id"],
+                            status=transport_status,
+                            retry_count=retry_count,
+                            last_error_type=adapter_result.get("error_type"),
+                            last_error_message=adapter_result.get("error_message"),
+                            updated_at=now,
+                        ).to_dict()
+                    )
+                    continue
+
+                parsed = task_handler.parse_result(
+                    raw_output=adapter_result["raw_output"],
+                    unit=unit,
+                    step_config=step_config,
+                    prompt_context=prompt_context,
+                )
+                validate_task_parse_result(parsed)
+
+                retry_count = _current_retry_count(progress_df, adapter_result["unit_id"])
+                if parsed["status"] == "retryable_error":
                     retry_count += 1
 
                 batch_progress_rows.append(
                     LLMProgressRecord(
-                        unit_id=result["unit_id"],
-                        status=status,
+                        unit_id=adapter_result["unit_id"],
+                        status=parsed["status"],
                         retry_count=retry_count,
-                        last_error_type=result.get("error_type"),
-                        last_error_message=result.get("error_message"),
+                        last_error_type=parsed.get("error_type"),
+                        last_error_message=parsed.get("error_message"),
                         updated_at=now,
                     ).to_dict()
                 )
 
-                if status == "success":
+                if parsed["status"] == "success":
                     batch_result_rows.append(
                         LLMResultRecord(
-                            unit_id=result["unit_id"],
+                            unit_id=adapter_result["unit_id"],
                             row_id=unit["row_id"],
                             output_column=unit["output_column"],
-                            status=status,
+                            status=parsed["status"],
                             parsed_output=(
-                                result["parsed_output"]
-                                if isinstance(result["parsed_output"], str)
-                                else json.dumps(result["parsed_output"], ensure_ascii=False)
-                            ) if result.get("parsed_output") is not None else None,
-                            raw_output=result.get("raw_output"),
-                            error_type=result.get("error_type"),
-                            error_message=result.get("error_message"),
+                                parsed["parsed_output"]
+                                if isinstance(parsed["parsed_output"], str)
+                                else json.dumps(parsed["parsed_output"], ensure_ascii=False)
+                            ) if parsed.get("parsed_output") is not None else None,
+                            output_value=parsed.get("output_value"),
+                            raw_output=adapter_result.get("raw_output"),
+                            error_type=parsed.get("error_type"),
+                            error_message=parsed.get("error_message"),
                         ).to_dict()
                     )
 
