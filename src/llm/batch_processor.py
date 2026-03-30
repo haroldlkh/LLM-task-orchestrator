@@ -6,12 +6,13 @@ from .batch_rows import (
     mark_group_transport_failure,
 )
 from .batch_runtime import (
+    decide_next_group_size,
     flush_buffers,
+    init_controller_state,
     log_progress,
     merge_progress_rows_in_memory,
-    next_larger_group_size,
-    next_smaller_group_size,
     should_flush,
+    useful_work_count_for_group,
 )
 from .models import LLMRunOutcome
 from .validators import (
@@ -39,9 +40,6 @@ def process_batches(
     current_group_size = runtime["initial_group_size"]
     min_group_size = runtime["min_group_size"]
     max_group_size = runtime["max_group_size"]
-    grow_after_successes = runtime["grow_after_successes"]
-    grow_step = runtime["grow_step"]
-    shrink_factor = runtime["shrink_factor"]
     log_every_n_groups = runtime["log_every_n_groups"]
 
     total_units = len(pending_rows)
@@ -61,6 +59,7 @@ def process_batches(
     units_since_flush = 0
     last_flush_time = time.time()
     stop_reason = None
+    controller_state = init_controller_state()
 
     while cursor < total_units:
         elapsed = time.time() - start_time
@@ -108,10 +107,10 @@ def process_batches(
 
         request = requests[0]
         expected_request_ids = [request["request_id"]]
-
         last_exception = None
         adapter_results = None
         request_attempt_count = 0
+        request_started_at = time.time()
 
         for attempt in range(max_request_retries + 1):
             request_attempt_count = attempt + 1
@@ -136,26 +135,9 @@ def process_batches(
                 )
                 time.sleep(retry_backoff_seconds * (attempt + 1))
 
-        if last_exception is not None:
-            if current_group_size > min_group_size:
-                new_group_size = next_smaller_group_size(
-                    current_group_size, min_group_size, shrink_factor
-                )
-                print(
-                    (
-                        f"[llm:{step_config['name']}] "
-                        f"group={group_index} "
-                        f"action=shrink_on_request_exception "
-                        f"old_group_size={current_group_size} "
-                        f"new_group_size={new_group_size} "
-                        f"error={str(last_exception)}"
-                    ),
-                    flush=True,
-                )
-                current_group_size = new_group_size
-                success_streak = 0
-                continue
+        request_seconds = max(time.time() - request_started_at, 1e-6)
 
+        if last_exception is not None:
             progress_rows, debug_rows = mark_group_parse_failure(
                 group_units=group_units,
                 request=request,
@@ -173,7 +155,34 @@ def process_batches(
             cursor += len(group_units)
             groups_since_flush += 1
             units_since_flush += len(group_units)
-            success_streak = 0
+
+            decision = decide_next_group_size(
+                current_group_size=current_group_size,
+                min_group_size=min_group_size,
+                max_group_size=max_group_size,
+                runtime=runtime,
+                controller_state=controller_state,
+                useful_work_count=0,
+                total_units=len(group_units),
+                failed_units=len(group_units),
+                request_seconds=request_seconds,
+                transport_failure=False,
+                whole_group_parse_failure=True,
+                success_streak=success_streak,
+            )
+            new_group_size = decision["new_group_size"]
+            if new_group_size != current_group_size:
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} action={decision['action']} "
+                        f"old_group_size={current_group_size} new_group_size={new_group_size} "
+                        f"reason={decision['note']}"
+                    ),
+                    flush=True,
+                )
+            current_group_size = new_group_size
+            success_streak = decision["new_success_streak"]
 
             log_progress(
                 step_name=step_config["name"],
@@ -184,28 +193,27 @@ def process_batches(
                 current_group_size=current_group_size,
                 success_streak=success_streak,
                 progress_by_unit=progress_by_unit,
-                note="marked_group_request_exception_at_min_group_size",
+                note="marked_group_request_exception",
                 start_time=start_time,
+                request_seconds=request_seconds,
+                useful_work_count=0,
+                failure_rate=1.0,
+                score=decision["score"],
             )
 
             if should_flush(
-                pending_progress_rows=pending_progress_rows,
-                pending_result_rows=pending_result_rows,
-                pending_debug_rows=pending_debug_rows,
-                groups_since_flush=groups_since_flush,
-                units_since_flush=units_since_flush,
-                last_flush_time=last_flush_time,
-                runtime=runtime,
+                pending_progress_rows, pending_result_rows, pending_debug_rows,
+                groups_since_flush, units_since_flush, last_flush_time, runtime,
             ):
                 flush_out = flush_buffers(
-                    flush_callback=flush_callback,
-                    pending_progress_rows=pending_progress_rows,
-                    pending_result_rows=pending_result_rows,
-                    pending_debug_rows=pending_debug_rows,
-                    processed_count=processed_count,
-                    remaining_units=max(total_units - cursor, 0),
-                    current_group_size=current_group_size,
-                    success_streak=success_streak,
+                    flush_callback,
+                    pending_progress_rows,
+                    pending_result_rows,
+                    pending_debug_rows,
+                    processed_count,
+                    max(total_units - cursor, 0),
+                    current_group_size,
+                    success_streak,
                 )
                 if flush_out.get("counted_flush"):
                     completed_flushes += 1
@@ -215,15 +223,9 @@ def process_batches(
                 if max_flushes_per_run is not None and completed_flushes >= max_flushes_per_run:
                     stop_reason = "max_flushes_per_run_reached"
                     log_progress(
-                        step_name=step_config["name"],
-                        group_index=group_index,
-                        total_units=total_units,
-                        processed_count=processed_count,
-                        cursor=cursor,
-                        current_group_size=current_group_size,
-                        success_streak=success_streak,
-                        progress_by_unit=progress_by_unit,
-                        note=stop_reason,
+                        step_name=step_config["name"], group_index=group_index, total_units=total_units,
+                        processed_count=processed_count, cursor=cursor, current_group_size=current_group_size,
+                        success_streak=success_streak, progress_by_unit=progress_by_unit, note=stop_reason,
                         start_time=start_time,
                     )
                     break
@@ -232,26 +234,6 @@ def process_batches(
         request_result = adapter_results[0]
 
         if request_result["status"] != "success":
-            if request_result["status"] == "retryable_error" and current_group_size > min_group_size:
-                new_group_size = next_smaller_group_size(
-                    current_group_size, min_group_size, shrink_factor
-                )
-                print(
-                    (
-                        f"[llm:{step_config['name']}] "
-                        f"group={group_index} "
-                        f"action=shrink_on_transport_retryable "
-                        f"old_group_size={current_group_size} "
-                        f"new_group_size={new_group_size} "
-                        f"error_type={request_result.get('error_type')} "
-                        f"error_message={request_result.get('error_message')}"
-                    ),
-                    flush=True,
-                )
-                current_group_size = new_group_size
-                success_streak = 0
-                continue
-
             progress_rows, debug_rows = mark_group_transport_failure(
                 group_units=group_units,
                 request=request,
@@ -267,7 +249,34 @@ def process_batches(
             cursor += len(group_units)
             groups_since_flush += 1
             units_since_flush += len(group_units)
-            success_streak = 0
+
+            decision = decide_next_group_size(
+                current_group_size=current_group_size,
+                min_group_size=min_group_size,
+                max_group_size=max_group_size,
+                runtime=runtime,
+                controller_state=controller_state,
+                useful_work_count=0,
+                total_units=len(group_units),
+                failed_units=len(group_units),
+                request_seconds=request_seconds,
+                transport_failure=True,
+                whole_group_parse_failure=False,
+                success_streak=success_streak,
+            )
+            new_group_size = decision["new_group_size"]
+            if new_group_size != current_group_size:
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} action={decision['action']} "
+                        f"old_group_size={current_group_size} new_group_size={new_group_size} "
+                        f"reason={decision['note']}"
+                    ),
+                    flush=True,
+                )
+            current_group_size = new_group_size
+            success_streak = decision["new_success_streak"]
 
             log_progress(
                 step_name=step_config["name"],
@@ -280,26 +289,25 @@ def process_batches(
                 progress_by_unit=progress_by_unit,
                 note=f"transport_non_success status={request_result['status']}",
                 start_time=start_time,
+                request_seconds=request_seconds,
+                useful_work_count=0,
+                failure_rate=1.0,
+                score=decision["score"],
             )
 
             if should_flush(
-                pending_progress_rows=pending_progress_rows,
-                pending_result_rows=pending_result_rows,
-                pending_debug_rows=pending_debug_rows,
-                groups_since_flush=groups_since_flush,
-                units_since_flush=units_since_flush,
-                last_flush_time=last_flush_time,
-                runtime=runtime,
+                pending_progress_rows, pending_result_rows, pending_debug_rows,
+                groups_since_flush, units_since_flush, last_flush_time, runtime,
             ):
                 flush_out = flush_buffers(
-                    flush_callback=flush_callback,
-                    pending_progress_rows=pending_progress_rows,
-                    pending_result_rows=pending_result_rows,
-                    pending_debug_rows=pending_debug_rows,
-                    processed_count=processed_count,
-                    remaining_units=max(total_units - cursor, 0),
-                    current_group_size=current_group_size,
-                    success_streak=success_streak,
+                    flush_callback,
+                    pending_progress_rows,
+                    pending_result_rows,
+                    pending_debug_rows,
+                    processed_count,
+                    max(total_units - cursor, 0),
+                    current_group_size,
+                    success_streak,
                 )
                 if flush_out.get("counted_flush"):
                     completed_flushes += 1
@@ -309,15 +317,9 @@ def process_batches(
                 if max_flushes_per_run is not None and completed_flushes >= max_flushes_per_run:
                     stop_reason = "max_flushes_per_run_reached"
                     log_progress(
-                        step_name=step_config["name"],
-                        group_index=group_index,
-                        total_units=total_units,
-                        processed_count=processed_count,
-                        cursor=cursor,
-                        current_group_size=current_group_size,
-                        success_streak=success_streak,
-                        progress_by_unit=progress_by_unit,
-                        note=stop_reason,
+                        step_name=step_config["name"], group_index=group_index, total_units=total_units,
+                        processed_count=processed_count, cursor=cursor, current_group_size=current_group_size,
+                        success_streak=success_streak, progress_by_unit=progress_by_unit, note=stop_reason,
                         start_time=start_time,
                     )
                     break
@@ -333,25 +335,6 @@ def process_batches(
             expected_unit_ids = [unit["unit_id"] for unit in group_units]
             validate_grouped_parse_results(parse_results, expected_unit_ids)
         except Exception as e:
-            if current_group_size > min_group_size:
-                new_group_size = next_smaller_group_size(
-                    current_group_size, min_group_size, shrink_factor
-                )
-                print(
-                    (
-                        f"[llm:{step_config['name']}] "
-                        f"group={group_index} "
-                        f"action=shrink_on_parse_exception "
-                        f"old_group_size={current_group_size} "
-                        f"new_group_size={new_group_size} "
-                        f"error={str(e)}"
-                    ),
-                    flush=True,
-                )
-                current_group_size = new_group_size
-                success_streak = 0
-                continue
-
             progress_rows, debug_rows = mark_group_parse_failure(
                 group_units=group_units,
                 request=request,
@@ -369,7 +352,34 @@ def process_batches(
             cursor += len(group_units)
             groups_since_flush += 1
             units_since_flush += len(group_units)
-            success_streak = 0
+
+            decision = decide_next_group_size(
+                current_group_size=current_group_size,
+                min_group_size=min_group_size,
+                max_group_size=max_group_size,
+                runtime=runtime,
+                controller_state=controller_state,
+                useful_work_count=0,
+                total_units=len(group_units),
+                failed_units=len(group_units),
+                request_seconds=request_seconds,
+                transport_failure=False,
+                whole_group_parse_failure=True,
+                success_streak=success_streak,
+            )
+            new_group_size = decision["new_group_size"]
+            if new_group_size != current_group_size:
+                print(
+                    (
+                        f"[llm:{step_config['name']}] "
+                        f"group={group_index} action={decision['action']} "
+                        f"old_group_size={current_group_size} new_group_size={new_group_size} "
+                        f"reason={decision['note']}"
+                    ),
+                    flush=True,
+                )
+            current_group_size = new_group_size
+            success_streak = decision["new_success_streak"]
 
             log_progress(
                 step_name=step_config["name"],
@@ -380,28 +390,27 @@ def process_batches(
                 current_group_size=current_group_size,
                 success_streak=success_streak,
                 progress_by_unit=progress_by_unit,
-                note="marked_group_parse_exception_at_min_group_size",
+                note="marked_group_parse_exception",
                 start_time=start_time,
+                request_seconds=request_seconds,
+                useful_work_count=0,
+                failure_rate=1.0,
+                score=decision["score"],
             )
 
             if should_flush(
-                pending_progress_rows=pending_progress_rows,
-                pending_result_rows=pending_result_rows,
-                pending_debug_rows=pending_debug_rows,
-                groups_since_flush=groups_since_flush,
-                units_since_flush=units_since_flush,
-                last_flush_time=last_flush_time,
-                runtime=runtime,
+                pending_progress_rows, pending_result_rows, pending_debug_rows,
+                groups_since_flush, units_since_flush, last_flush_time, runtime,
             ):
                 flush_out = flush_buffers(
-                    flush_callback=flush_callback,
-                    pending_progress_rows=pending_progress_rows,
-                    pending_result_rows=pending_result_rows,
-                    pending_debug_rows=pending_debug_rows,
-                    processed_count=processed_count,
-                    remaining_units=max(total_units - cursor, 0),
-                    current_group_size=current_group_size,
-                    success_streak=success_streak,
+                    flush_callback,
+                    pending_progress_rows,
+                    pending_result_rows,
+                    pending_debug_rows,
+                    processed_count,
+                    max(total_units - cursor, 0),
+                    current_group_size,
+                    success_streak,
                 )
                 if flush_out.get("counted_flush"):
                     completed_flushes += 1
@@ -411,15 +420,9 @@ def process_batches(
                 if max_flushes_per_run is not None and completed_flushes >= max_flushes_per_run:
                     stop_reason = "max_flushes_per_run_reached"
                     log_progress(
-                        step_name=step_config["name"],
-                        group_index=group_index,
-                        total_units=total_units,
-                        processed_count=processed_count,
-                        cursor=cursor,
-                        current_group_size=current_group_size,
-                        success_streak=success_streak,
-                        progress_by_unit=progress_by_unit,
-                        note=stop_reason,
+                        step_name=step_config["name"], group_index=group_index, total_units=total_units,
+                        processed_count=processed_count, cursor=cursor, current_group_size=current_group_size,
+                        success_streak=success_streak, progress_by_unit=progress_by_unit, note=stop_reason,
                         start_time=start_time,
                     )
                     break
@@ -433,7 +436,6 @@ def process_batches(
             progress_df=progress_df,
             request_attempt_count=request_attempt_count,
         )
-
         pending_progress_rows.extend(progress_rows)
         pending_result_rows.extend(result_rows)
         pending_debug_rows.extend(debug_rows)
@@ -444,42 +446,35 @@ def process_batches(
         groups_since_flush += 1
         units_since_flush += len(group_units)
 
-        all_success = all(row["status"] == "success" for row in parse_results)
-        if all_success:
-            success_streak += 1
-            if success_streak >= grow_after_successes and current_group_size < max_group_size:
-                new_group_size = next_larger_group_size(
-                    current_group_size, max_group_size, grow_step
-                )
-                print(
-                    (
-                        f"[llm:{step_config['name']}] "
-                        f"group={group_index} "
-                        f"action=grow "
-                        f"old_group_size={current_group_size} "
-                        f"new_group_size={new_group_size}"
-                    ),
-                    flush=True,
-                )
-                current_group_size = new_group_size
-                success_streak = 0
-        else:
-            if current_group_size > min_group_size:
-                new_group_size = next_smaller_group_size(
-                    current_group_size, min_group_size, shrink_factor
-                )
-                print(
-                    (
-                        f"[llm:{step_config['name']}] "
-                        f"group={group_index} "
-                        f"action=shrink_on_partial_non_success "
-                        f"old_group_size={current_group_size} "
-                        f"new_group_size={new_group_size}"
-                    ),
-                    flush=True,
-                )
-                current_group_size = new_group_size
-            success_streak = 0
+        failed_units = sum(1 for row in parse_results if row["status"] != "success")
+        useful_work_count = useful_work_count_for_group(group_units, parse_results, runtime["flush_scope"])
+        decision = decide_next_group_size(
+            current_group_size=current_group_size,
+            min_group_size=min_group_size,
+            max_group_size=max_group_size,
+            runtime=runtime,
+            controller_state=controller_state,
+            useful_work_count=useful_work_count,
+            total_units=len(group_units),
+            failed_units=failed_units,
+            request_seconds=request_seconds,
+            transport_failure=False,
+            whole_group_parse_failure=False,
+            success_streak=success_streak,
+        )
+        new_group_size = decision["new_group_size"]
+        if new_group_size != current_group_size:
+            print(
+                (
+                    f"[llm:{step_config['name']}] "
+                    f"group={group_index} action={decision['action']} "
+                    f"old_group_size={current_group_size} new_group_size={new_group_size} "
+                    f"reason={decision['note']}"
+                ),
+                flush=True,
+            )
+        current_group_size = new_group_size
+        success_streak = decision["new_success_streak"]
 
         log_progress(
             step_name=step_config["name"],
@@ -492,26 +487,25 @@ def process_batches(
             progress_by_unit=progress_by_unit,
             note="group_complete",
             start_time=start_time,
+            request_seconds=request_seconds,
+            useful_work_count=useful_work_count,
+            failure_rate=decision["failure_rate"],
+            score=decision["score"],
         )
 
         if should_flush(
-            pending_progress_rows=pending_progress_rows,
-            pending_result_rows=pending_result_rows,
-            pending_debug_rows=pending_debug_rows,
-            groups_since_flush=groups_since_flush,
-            units_since_flush=units_since_flush,
-            last_flush_time=last_flush_time,
-            runtime=runtime,
+            pending_progress_rows, pending_result_rows, pending_debug_rows,
+            groups_since_flush, units_since_flush, last_flush_time, runtime,
         ):
             flush_out = flush_buffers(
-                flush_callback=flush_callback,
-                pending_progress_rows=pending_progress_rows,
-                pending_result_rows=pending_result_rows,
-                pending_debug_rows=pending_debug_rows,
-                processed_count=processed_count,
-                remaining_units=max(total_units - cursor, 0),
-                current_group_size=current_group_size,
-                success_streak=success_streak,
+                flush_callback,
+                pending_progress_rows,
+                pending_result_rows,
+                pending_debug_rows,
+                processed_count,
+                max(total_units - cursor, 0),
+                current_group_size,
+                success_streak,
             )
             if flush_out.get("counted_flush"):
                 completed_flushes += 1
@@ -521,31 +515,23 @@ def process_batches(
             if max_flushes_per_run is not None and completed_flushes >= max_flushes_per_run:
                 stop_reason = "max_flushes_per_run_reached"
                 log_progress(
-                    step_name=step_config["name"],
-                    group_index=group_index,
-                    total_units=total_units,
-                    processed_count=processed_count,
-                    cursor=cursor,
-                    current_group_size=current_group_size,
-                    success_streak=success_streak,
-                    progress_by_unit=progress_by_unit,
-                    note=stop_reason,
+                    step_name=step_config["name"], group_index=group_index, total_units=total_units,
+                    processed_count=processed_count, cursor=cursor, current_group_size=current_group_size,
+                    success_streak=success_streak, progress_by_unit=progress_by_unit, note=stop_reason,
                     start_time=start_time,
                 )
                 break
 
-    flush_out = flush_buffers(
-        flush_callback=flush_callback,
-        pending_progress_rows=pending_progress_rows,
-        pending_result_rows=pending_result_rows,
-        pending_debug_rows=pending_debug_rows,
-        processed_count=processed_count,
-        remaining_units=max(total_units - cursor, 0),
-        current_group_size=current_group_size,
-        success_streak=success_streak,
+    flush_buffers(
+        flush_callback,
+        pending_progress_rows,
+        pending_result_rows,
+        pending_debug_rows,
+        processed_count,
+        max(total_units - cursor, 0),
+        current_group_size,
+        success_streak,
     )
-    if flush_out.get("counted_flush"):
-        completed_flushes += 1
 
     remaining_units = max(total_units - processed_count, 0)
     outcome = LLMRunOutcome(
@@ -556,12 +542,9 @@ def process_batches(
 
     print(
         (
-            f"[llm:{step_config['name']}] "
-            f"run_end "
-            f"processed={processed_count}/{total_units} "
-            f"remaining={remaining_units} "
-            f"outcome={outcome.status} "
-            f"completed_flushes={completed_flushes}"
+            f"[llm:{step_config['name']}] run_end "
+            f"processed={processed_count}/{total_units} remaining={remaining_units} "
+            f"outcome={outcome.status} completed_flushes={completed_flushes}"
         ),
         flush=True,
     )

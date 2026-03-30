@@ -22,19 +22,14 @@ def sanitize_name(name: str) -> str:
 
 def ensure_llm_state_layout(
     dest_connector,
-    dest_location: str,
-    pipeline_name: str,
-    step_name: str,
+    workflow_location: str,
 ) -> Dict[str, str]:
-    pipeline_folder = dest_connector.ensure_subdir(dest_location, sanitize_name(pipeline_name))
-    step_folder = dest_connector.ensure_subdir(pipeline_folder, sanitize_name(step_name))
-    state_folder = dest_connector.ensure_subdir(step_folder, "state")
-    results_folder = dest_connector.ensure_subdir(step_folder, "results")
-    debug_folder = dest_connector.ensure_subdir(step_folder, "debug")
+    state_folder = dest_connector.ensure_subdir(workflow_location, "state")
+    results_folder = dest_connector.ensure_subdir(workflow_location, "results")
+    debug_folder = dest_connector.ensure_subdir(workflow_location, "debug")
 
     return {
-        "pipeline_folder": pipeline_folder,
-        "step_folder": step_folder,
+        "workflow_folder": workflow_location,
         "state_folder": state_folder,
         "results_folder": results_folder,
         "debug_folder": debug_folder,

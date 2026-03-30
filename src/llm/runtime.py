@@ -15,7 +15,7 @@ def default_runtime(step_config: dict) -> dict:
         "max_group_size": runtime.get("max_group_size", 16),
         "grow_after_successes": runtime.get("grow_after_successes", 2),
         "grow_step": runtime.get("grow_step", 1),
-        "shrink_factor": runtime.get("shrink_factor", 0.5),
+        "shrink_factor": runtime.get("shrink_factor", 0.75),
         "flush_every_n_units": runtime.get("flush_every_n_units", 50),
         "flush_every_n_groups": runtime.get("flush_every_n_groups", 1),
         "flush_every_n_seconds": runtime.get("flush_every_n_seconds", 60),
@@ -29,6 +29,11 @@ def default_runtime(step_config: dict) -> dict:
         "input_row_offset": runtime.get("input_row_offset", 0),
         "write_partial_merged_output": runtime.get("write_partial_merged_output", True),
         "write_pair_status": runtime.get("write_pair_status", True),
+        "soft_failure_rate": runtime.get("soft_failure_rate", 0.02),
+        "hard_failure_rate": runtime.get("hard_failure_rate", 0.10),
+        "throughput_tolerance": runtime.get("throughput_tolerance", 0.05),
+        "throughput_ema_alpha": runtime.get("throughput_ema_alpha", 0.30),
+        "mild_shrink_factor": runtime.get("mild_shrink_factor", 0.9),
     }
 
 
@@ -77,6 +82,8 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'grow_step' must be >= 1")
     if runtime["shrink_factor"] <= 0 or runtime["shrink_factor"] >= 1:
         raise ValueError("LLM runtime 'shrink_factor' must be > 0 and < 1")
+    if runtime["mild_shrink_factor"] <= 0 or runtime["mild_shrink_factor"] > 1:
+        raise ValueError("LLM runtime 'mild_shrink_factor' must be > 0 and <= 1")
     if runtime["flush_every_n_units"] < 1:
         raise ValueError("LLM runtime 'flush_every_n_units' must be >= 1")
     if runtime["flush_every_n_groups"] < 1:
@@ -101,6 +108,16 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'input_row_limit' must be >= 1 when provided")
     if runtime["input_row_offset"] < 0:
         raise ValueError("LLM runtime 'input_row_offset' must be >= 0")
+    if not 0 <= runtime["soft_failure_rate"] <= 1:
+        raise ValueError("LLM runtime 'soft_failure_rate' must be between 0 and 1")
+    if not 0 <= runtime["hard_failure_rate"] <= 1:
+        raise ValueError("LLM runtime 'hard_failure_rate' must be between 0 and 1")
+    if runtime["soft_failure_rate"] > runtime["hard_failure_rate"]:
+        raise ValueError("LLM runtime 'soft_failure_rate' must be <= 'hard_failure_rate'")
+    if runtime["throughput_tolerance"] < 0:
+        raise ValueError("LLM runtime 'throughput_tolerance' must be >= 0")
+    if not 0 < runtime["throughput_ema_alpha"] <= 1:
+        raise ValueError("LLM runtime 'throughput_ema_alpha' must be > 0 and <= 1")
 
 
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:

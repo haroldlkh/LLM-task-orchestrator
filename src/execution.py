@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 
 from loader_factory import get_loader
 from llm.executor import execute_llm_step
+from llm.state import sanitize_name
 
 
 def run_pipeline_steps(
@@ -55,6 +56,10 @@ def save_final_output(loader, data, dest_location, dest_connector, output_name):
         raise RuntimeError("No output file was created.")
 
 
+def _workflow_location(dest_connector, dest_location: str, executable_name: str) -> str:
+    return dest_connector.ensure_subdir(dest_location, sanitize_name(executable_name))
+
+
 def run_global_execution(
     source_connector,
     dest_connector,
@@ -85,19 +90,21 @@ def run_global_execution(
         loader = get_loader(data_type, temp_dir)
         data = loader.load(target_cols)
 
+        workflow_location = _workflow_location(dest_connector, dest_location, executable["name"])
+
         if executable["kind"] == "task":
             result = run_single_task_runner(executable["runner"], data)
         else:
             runtime_context = {
                 "dest_connector": dest_connector,
-                "dest_location": dest_location,
+                "dest_location": workflow_location,
                 "pipeline_name": executable["name"],
                 "temp_dir": temp_dir,
                 "user_runtime_config": user_runtime_config,
             }
             result = run_pipeline_steps(executable["steps"], data, runtime_context)
 
-        save_final_output(loader, result, dest_location, dest_connector, output_name)
+        save_final_output(loader, result, workflow_location, dest_connector, output_name)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -121,6 +128,7 @@ def run_batched_execution(
     ]
 
     print(f"Discovered {len(all_files)} parquet file(s) in source location.")
+    workflow_location = _workflow_location(dest_connector, dest_location, executable["name"])
 
     for i in range(0, len(all_files), batch_size):
         batch = all_files[i:i + batch_size]
@@ -144,7 +152,7 @@ def run_batched_execution(
             else:
                 runtime_context = {
                     "dest_connector": dest_connector,
-                    "dest_location": dest_location,
+                    "dest_location": workflow_location,
                     "pipeline_name": executable["name"],
                     "temp_dir": temp_dir,
                     "user_runtime_config": user_runtime_config,
@@ -152,7 +160,7 @@ def run_batched_execution(
                 result = run_pipeline_steps(executable["steps"], data, runtime_context)
 
             batch_output_name = f"{output_name}_batch_{batch_num}"
-            save_final_output(loader, result, dest_location, dest_connector, batch_output_name)
+            save_final_output(loader, result, workflow_location, dest_connector, batch_output_name)
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
