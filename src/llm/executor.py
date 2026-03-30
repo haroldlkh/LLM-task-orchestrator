@@ -16,7 +16,7 @@ from .state import (
     upload_versioned_parquet,
     utc_now_iso,
 )
-from .task_loader import build_task_handler
+from .llm_task_loader import build_task_handler
 from .validators import (
     validate_adapter_batch_results,
     validate_task_parse_result,
