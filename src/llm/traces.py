@@ -50,6 +50,8 @@ def debug_rows_to_df(rows: List[dict]) -> pl.DataFrame:
                 "row_id": pl.Utf8,
                 "field_name": pl.Utf8,
                 "output_column": pl.Utf8,
+                "request_group_id": pl.Utf8,
+                "request_group_size": pl.Int64,
                 "status": pl.Utf8,
                 "review_flag": pl.Boolean,
                 "review_reason": pl.Utf8,

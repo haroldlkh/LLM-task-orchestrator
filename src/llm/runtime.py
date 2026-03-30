@@ -1,3 +1,5 @@
+import polars as pl
+
 from .models import LLMRunOutcome
 from .state import utc_now_iso
 
@@ -5,11 +7,16 @@ from .state import utc_now_iso
 def default_runtime(step_config: dict) -> dict:
     runtime = step_config.get("runtime", {})
     return {
-        "max_units_per_batch": runtime.get("max_units_per_batch", 10),
+        "initial_group_size": runtime.get("initial_group_size", 4),
+        "min_group_size": runtime.get("min_group_size", 1),
+        "max_group_size": runtime.get("max_group_size", 16),
+        "grow_after_successes": runtime.get("grow_after_successes", 2),
+        "grow_step": runtime.get("grow_step", 1),
+        "shrink_factor": runtime.get("shrink_factor", 0.5),
         "flush_every_n_units": runtime.get("flush_every_n_units", 50),
         "soft_time_limit_minutes": runtime.get("soft_time_limit_minutes", 40),
         "max_request_retries": runtime.get("max_request_retries", 3),
-        "retry_backoff_seconds": runtime.get("retry_backoff_seconds", 5),
+        "retry_backoff_seconds": runtime.get("retry_backoff_seconds", 10),
     }
 
 
@@ -41,20 +48,20 @@ def validate_llm_step(step_config: dict):
             )
 
 
-def success_or_terminal_unit_ids(progress_df) -> set:
+def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
     if progress_df.is_empty():
         return set()
 
     terminal = progress_df.filter(
-        progress_df["status"].is_in(["success", "permanent_error"])
+        pl.col("status").is_in(["success", "permanent_error"])
     )
     return set(terminal["unit_id"].to_list())
 
 
-def current_retry_count(progress_df, unit_id: str) -> int:
+def current_retry_count(progress_df: pl.DataFrame, unit_id: str) -> int:
     if progress_df.is_empty():
         return 0
-    rows = progress_df.filter(progress_df["unit_id"] == unit_id)
+    rows = progress_df.filter(pl.col("unit_id") == unit_id)
     if rows.is_empty():
         return 0
     return int(rows["retry_count"].to_list()[-1])
@@ -62,8 +69,8 @@ def current_retry_count(progress_df, unit_id: str) -> int:
 
 def build_runtime_metadata(
     step_config: dict,
-    work_units_df,
-    progress_df,
+    work_units_df: pl.DataFrame,
+    progress_df: pl.DataFrame,
     outcome: LLMRunOutcome,
 ) -> dict:
     return {

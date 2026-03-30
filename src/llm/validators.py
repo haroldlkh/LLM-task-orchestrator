@@ -3,15 +3,16 @@ from typing import Dict, List
 from .models import VALID_UNIT_STATUSES
 
 
-ADAPTER_RESULT_KEYS = {
-    "unit_id",
+GROUPED_ADAPTER_RESULT_KEYS = {
+    "request_id",
     "status",
     "raw_output",
     "error_type",
     "error_message",
 }
 
-TASK_PARSE_RESULT_KEYS = {
+GROUPED_PARSE_RESULT_KEYS = {
+    "unit_id",
     "status",
     "parsed_output",
     "output_value",
@@ -20,51 +21,61 @@ TASK_PARSE_RESULT_KEYS = {
 }
 
 
-def validate_adapter_result(result: Dict) -> None:
-    missing = ADAPTER_RESULT_KEYS - set(result.keys())
+def validate_grouped_adapter_result(result: Dict) -> None:
+    missing = GROUPED_ADAPTER_RESULT_KEYS - set(result.keys())
     if missing:
-        raise ValueError(f"Adapter result missing keys: {sorted(missing)}")
+        raise ValueError(f"Grouped adapter result missing keys: {sorted(missing)}")
 
     status = result["status"]
     if status not in VALID_UNIT_STATUSES:
         raise ValueError(
-            f"Invalid adapter result status '{status}'. "
+            f"Invalid grouped adapter result status '{status}'. "
             f"Expected one of {sorted(VALID_UNIT_STATUSES)}"
         )
 
 
-def validate_adapter_batch_results(
+def validate_grouped_adapter_batch_results(
     batch_results: List[Dict],
-    expected_unit_ids: List[str],
+    expected_request_ids: List[str],
 ) -> None:
-    if len(batch_results) != len(expected_unit_ids):
+    if len(batch_results) != len(expected_request_ids):
         raise ValueError(
-            f"Adapter returned {len(batch_results)} results for "
-            f"{len(expected_unit_ids)} work units"
+            f"Adapter returned {len(batch_results)} grouped results for "
+            f"{len(expected_request_ids)} grouped requests"
         )
 
     seen = set()
     for result in batch_results:
-        validate_adapter_result(result)
+        validate_grouped_adapter_result(result)
+        request_id = result["request_id"]
+        if request_id not in expected_request_ids:
+            raise ValueError(f"Adapter returned unknown request_id '{request_id}'")
+        if request_id in seen:
+            raise ValueError(f"Adapter returned duplicate request_id '{request_id}'")
+        seen.add(request_id)
+
+
+def validate_grouped_parse_results(
+    parse_results: List[Dict],
+    expected_unit_ids: List[str],
+) -> None:
+    seen = set()
+
+    for result in parse_results:
+        missing = GROUPED_PARSE_RESULT_KEYS - set(result.keys())
+        if missing:
+            raise ValueError(f"Grouped parse result missing keys: {sorted(missing)}")
+
+        status = result["status"]
+        if status not in VALID_UNIT_STATUSES:
+            raise ValueError(
+                f"Invalid grouped parse result status '{status}'. "
+                f"Expected one of {sorted(VALID_UNIT_STATUSES)}"
+            )
+
         unit_id = result["unit_id"]
         if unit_id not in expected_unit_ids:
-            raise ValueError(f"Adapter returned unknown unit_id '{unit_id}'")
+            raise ValueError(f"Grouped parse returned unknown unit_id '{unit_id}'")
         if unit_id in seen:
-            raise ValueError(f"Adapter returned duplicate unit_id '{unit_id}'")
+            raise ValueError(f"Grouped parse returned duplicate unit_id '{unit_id}'")
         seen.add(unit_id)
-
-
-def validate_task_parse_result(result: Dict) -> None:
-    missing = TASK_PARSE_RESULT_KEYS - set(result.keys())
-    if missing:
-        raise ValueError(f"Task parse result missing keys: {sorted(missing)}")
-
-    status = result["status"]
-    if status not in VALID_UNIT_STATUSES:
-        raise ValueError(
-            f"Invalid task parse result status '{status}'. "
-            f"Expected one of {sorted(VALID_UNIT_STATUSES)}"
-        )
-
-    if "review_flag" in result and not isinstance(result["review_flag"], bool):
-        raise ValueError("task parse result field 'review_flag' must be bool if provided")
