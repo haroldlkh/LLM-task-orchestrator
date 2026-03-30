@@ -163,10 +163,12 @@ def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.
                 "output_column": pl.Utf8,
                 "status": pl.Utf8,
                 "parsed_output": pl.Utf8,
-                "output_value": pl.Utf8,
+                "output_value": pl.Int64,
                 "raw_output": pl.Utf8,
                 "error_type": pl.Utf8,
                 "error_message": pl.Utf8,
+                "review_flag": pl.Boolean,
+                "review_reason": pl.Utf8,
             }
         )
     return pl.concat(chunks, how="vertical_relaxed")
@@ -230,10 +232,12 @@ def _result_rows_to_df(rows: List[dict]) -> pl.DataFrame:
                 "output_column": pl.Utf8,
                 "status": pl.Utf8,
                 "parsed_output": pl.Utf8,
-                "output_value": pl.Utf8,
+                "output_value": pl.Int64,
                 "raw_output": pl.Utf8,
                 "error_type": pl.Utf8,
                 "error_message": pl.Utf8,
+                "review_flag": pl.Boolean,
+                "review_reason": pl.Utf8,
             }
         )
     return pl.DataFrame(rows)
@@ -254,6 +258,30 @@ def _progress_rows_to_df(rows: List[dict]) -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
+def _debug_rows_to_df(rows: List[dict]) -> pl.DataFrame:
+    if not rows:
+        return pl.DataFrame(
+            schema={
+                "unit_id": pl.Utf8,
+                "row_id": pl.Utf8,
+                "field_name": pl.Utf8,
+                "output_column": pl.Utf8,
+                "status": pl.Utf8,
+                "review_flag": pl.Boolean,
+                "review_reason": pl.Utf8,
+                "error_type": pl.Utf8,
+                "error_message": pl.Utf8,
+                "input_text": pl.Utf8,
+                "rendered_prompt": pl.Utf8,
+                "raw_output": pl.Utf8,
+                "parsed_output": pl.Utf8,
+                "output_value": pl.Int64,
+                "updated_at": pl.Utf8,
+            }
+        )
+    return pl.DataFrame(rows)
+
+
 def _flush_state(
     connector,
     folders: dict,
@@ -261,6 +289,7 @@ def _flush_state(
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
     result_rows: List[dict],
+    debug_rows: List[dict],
     metadata: dict,
 ):
     upload_versioned_parquet(
@@ -289,6 +318,28 @@ def _flush_state(
             temp_dir=temp_dir,
         )
 
+    if debug_rows:
+        debug_df = _debug_rows_to_df(debug_rows)
+        upload_versioned_parquet(
+            connector=connector,
+            location=folders["debug_folder"],
+            prefix="traces",
+            df=debug_df,
+            temp_dir=temp_dir,
+        )
+
+        review_df = debug_df.filter(
+            (pl.col("status") != "success") | (pl.col("review_flag") == True)
+        )
+        if not review_df.is_empty():
+            upload_versioned_parquet(
+                connector=connector,
+                location=folders["debug_folder"],
+                prefix="review",
+                df=review_df,
+                temp_dir=temp_dir,
+            )
+
     upload_versioned_json(
         connector=connector,
         location=folders["state_folder"],
@@ -298,13 +349,51 @@ def _flush_state(
     )
 
 
-def _merge_results_back(source_df: pl.DataFrame, all_results_df: pl.DataFrame, row_id_column: str) -> pl.DataFrame:
+def _cast_output_columns_from_task(df: pl.DataFrame, task_handler, step_config: dict) -> pl.DataFrame:
+    if not hasattr(task_handler, "get_output_dtypes"):
+        return df
+
+    output_dtypes = task_handler.get_output_dtypes(step_config) or {}
+    if not output_dtypes:
+        return df
+
+    casts = []
+    for col_name, dtype_name in output_dtypes.items():
+        if col_name not in df.columns:
+            continue
+
+        if dtype_name == "Int64":
+            casts.append(pl.col(col_name).cast(pl.Int64))
+        elif dtype_name == "Int32":
+            casts.append(pl.col(col_name).cast(pl.Int32))
+        elif dtype_name == "Float64":
+            casts.append(pl.col(col_name).cast(pl.Float64))
+        elif dtype_name == "Utf8":
+            casts.append(pl.col(col_name).cast(pl.Utf8))
+        else:
+            raise ValueError(
+                f"Unsupported output dtype '{dtype_name}' for column '{col_name}'"
+            )
+
+    if not casts:
+        return df
+
+    return df.with_columns(casts)
+
+
+def _merge_results_back(
+    source_df: pl.DataFrame,
+    all_results_df: pl.DataFrame,
+    row_id_column: str,
+    task_handler,
+    step_config: dict,
+) -> pl.DataFrame:
     if all_results_df.is_empty():
-        return source_df
+        return _cast_output_columns_from_task(source_df, task_handler, step_config)
 
     success_df = all_results_df.filter(pl.col("status") == "success")
     if success_df.is_empty():
-        return source_df
+        return _cast_output_columns_from_task(source_df, task_handler, step_config)
 
     wide = (
         success_df
@@ -318,11 +407,13 @@ def _merge_results_back(source_df: pl.DataFrame, all_results_df: pl.DataFrame, r
         .rename({"row_id": row_id_column})
     )
 
-    return source_df.with_columns(pl.col(row_id_column).cast(pl.Utf8)).join(
+    merged = source_df.with_columns(pl.col(row_id_column).cast(pl.Utf8)).join(
         wide.with_columns(pl.col(row_id_column).cast(pl.Utf8)),
         on=row_id_column,
         how="left",
     )
+
+    return _cast_output_columns_from_task(merged, task_handler, step_config)
 
 
 def execute_llm_step(
@@ -399,12 +490,15 @@ def execute_llm_step(
             work_units_df=work_units_df,
             progress_df=progress_df,
             result_rows=[],
+            debug_rows=[],
             metadata=metadata,
         )
         return _merge_results_back(
             source_df=source_df,
             all_results_df=existing_results_df,
             row_id_column=step_config["row_id_column"],
+            task_handler=task_handler,
+            step_config=step_config,
         )
 
     start_time = time.time()
@@ -417,6 +511,7 @@ def execute_llm_step(
     processed_count = 0
     batch_result_rows = []
     batch_progress_rows = []
+    batch_debug_rows = []
 
     pending_rows = pending_units_df.to_dicts()
 
@@ -429,6 +524,7 @@ def execute_llm_step(
         expected_unit_ids = [unit["unit_id"] for unit in batch]
 
         requests = task_handler.build_requests(batch, step_config, prompt_context)
+        request_lookup = {req["unit_id"]: req for req in requests}
 
         last_exception = None
         adapter_results = None
@@ -459,6 +555,23 @@ def execute_llm_step(
                         updated_at=now,
                     ).to_dict()
                 )
+                batch_debug_rows.append({
+                    "unit_id": unit["unit_id"],
+                    "row_id": unit["row_id"],
+                    "field_name": unit["field_name"],
+                    "output_column": unit["output_column"],
+                    "status": "retryable_error",
+                    "review_flag": True,
+                    "review_reason": "batch_exception",
+                    "error_type": "batch_exception",
+                    "error_message": str(last_exception),
+                    "input_text": unit["input_text"],
+                    "rendered_prompt": request_lookup.get(unit["unit_id"], {}).get("prompt"),
+                    "raw_output": None,
+                    "parsed_output": None,
+                    "output_value": None,
+                    "updated_at": now,
+                })
             processed_count += len(batch)
         else:
             now = utc_now_iso()
@@ -482,6 +595,24 @@ def execute_llm_step(
                             updated_at=now,
                         ).to_dict()
                     )
+
+                    batch_debug_rows.append({
+                        "unit_id": adapter_result["unit_id"],
+                        "row_id": unit["row_id"],
+                        "field_name": unit["field_name"],
+                        "output_column": unit["output_column"],
+                        "status": transport_status,
+                        "review_flag": True,
+                        "review_reason": "adapter_non_success",
+                        "error_type": adapter_result.get("error_type"),
+                        "error_message": adapter_result.get("error_message"),
+                        "input_text": unit["input_text"],
+                        "rendered_prompt": request_lookup.get(unit["unit_id"], {}).get("prompt"),
+                        "raw_output": adapter_result.get("raw_output"),
+                        "parsed_output": None,
+                        "output_value": None,
+                        "updated_at": now,
+                    })
                     continue
 
                 parsed = task_handler.parse_result(
@@ -491,6 +622,9 @@ def execute_llm_step(
                     prompt_context=prompt_context,
                 )
                 validate_task_parse_result(parsed)
+
+                review_flag = parsed.get("review_flag", False)
+                review_reason = parsed.get("review_reason")
 
                 retry_count = _current_retry_count(progress_df, adapter_result["unit_id"])
                 if parsed["status"] == "retryable_error":
@@ -506,6 +640,30 @@ def execute_llm_step(
                         updated_at=now,
                     ).to_dict()
                 )
+
+                batch_debug_rows.append({
+                    "unit_id": adapter_result["unit_id"],
+                    "row_id": unit["row_id"],
+                    "field_name": unit["field_name"],
+                    "output_column": unit["output_column"],
+                    "status": parsed["status"],
+                    "review_flag": review_flag or (parsed["status"] != "success"),
+                    "review_reason": review_reason if review_reason else (
+                        "task_non_success" if parsed["status"] != "success" else None
+                    ),
+                    "error_type": parsed.get("error_type"),
+                    "error_message": parsed.get("error_message"),
+                    "input_text": unit["input_text"],
+                    "rendered_prompt": request_lookup.get(unit["unit_id"], {}).get("prompt"),
+                    "raw_output": adapter_result.get("raw_output"),
+                    "parsed_output": (
+                        parsed["parsed_output"]
+                        if isinstance(parsed.get("parsed_output"), str)
+                        else json.dumps(parsed.get("parsed_output"), ensure_ascii=False)
+                    ) if parsed.get("parsed_output") is not None else None,
+                    "output_value": parsed.get("output_value"),
+                    "updated_at": now,
+                })
 
                 if parsed["status"] == "success":
                     batch_result_rows.append(
@@ -523,6 +681,8 @@ def execute_llm_step(
                             raw_output=adapter_result.get("raw_output"),
                             error_type=parsed.get("error_type"),
                             error_message=parsed.get("error_message"),
+                            review_flag=review_flag,
+                            review_reason=review_reason,
                         ).to_dict()
                     )
 
@@ -552,11 +712,13 @@ def execute_llm_step(
                 work_units_df=work_units_df,
                 progress_df=progress_df,
                 result_rows=batch_result_rows,
+                debug_rows=batch_debug_rows,
                 metadata=metadata,
             )
 
             batch_result_rows = []
             batch_progress_rows = []
+            batch_debug_rows = []
 
     if batch_progress_rows:
         new_progress_df = _progress_rows_to_df(batch_progress_rows)
@@ -586,6 +748,7 @@ def execute_llm_step(
         work_units_df=work_units_df,
         progress_df=progress_df,
         result_rows=batch_result_rows,
+        debug_rows=batch_debug_rows,
         metadata=metadata,
     )
 
@@ -599,4 +762,6 @@ def execute_llm_step(
         source_df=source_df,
         all_results_df=existing_results_df,
         row_id_column=step_config["row_id_column"],
+        task_handler=task_handler,
+        step_config=step_config,
     )

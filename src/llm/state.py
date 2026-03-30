@@ -26,22 +26,18 @@ def ensure_llm_state_layout(
     pipeline_name: str,
     step_name: str,
 ) -> Dict[str, str]:
-    """
-    Creates:
-      <dest>/<pipeline_name>/<step_name>/state
-      <dest>/<pipeline_name>/<step_name>/results
-    and returns their connector-specific locations.
-    """
     pipeline_folder = dest_connector.ensure_subdir(dest_location, sanitize_name(pipeline_name))
     step_folder = dest_connector.ensure_subdir(pipeline_folder, sanitize_name(step_name))
     state_folder = dest_connector.ensure_subdir(step_folder, "state")
     results_folder = dest_connector.ensure_subdir(step_folder, "results")
+    debug_folder = dest_connector.ensure_subdir(step_folder, "debug")
 
     return {
         "pipeline_folder": pipeline_folder,
         "step_folder": step_folder,
         "state_folder": state_folder,
         "results_folder": results_folder,
+        "debug_folder": debug_folder,
     }
 
 

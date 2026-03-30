@@ -65,3 +65,6 @@ def validate_task_parse_result(result: Dict) -> None:
             f"Invalid task parse result status '{status}'. "
             f"Expected one of {sorted(VALID_UNIT_STATUSES)}"
         )
+
+    if "review_flag" in result and not isinstance(result["review_flag"], bool):
+        raise ValueError("task parse result field 'review_flag' must be bool if provided")
