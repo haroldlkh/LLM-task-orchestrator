@@ -1,13 +1,13 @@
 import hashlib
 import json
-import os
 import time
-from typing import Dict, List, Tuple
+from typing import List
 
 import polars as pl
 
 from .adapter_loader import build_adapter
 from .models import LLMProgressRecord, LLMResultRecord, LLMRunOutcome, LLMWorkUnit
+from .prompt_loader import load_prompt_context
 from .state import (
     download_all_parquet_by_prefix,
     download_latest_parquet_if_exists,
@@ -346,6 +346,7 @@ def execute_llm_step(
 
     provider_config = user_runtime_config[provider_config_key]
     adapter = build_adapter(step_config["adapter"], provider_config)
+    prompt_context = load_prompt_context(step_config)
 
     folders = ensure_llm_state_layout(
         dest_connector=dest_connector,
@@ -424,7 +425,7 @@ def execute_llm_step(
 
         for attempt in range(max_request_retries + 1):
             try:
-                adapter_results = adapter.execute_batch(batch, step_config)
+                adapter_results = adapter.execute_batch(batch, step_config, prompt_context)
                 validate_adapter_batch_results(adapter_results, expected_unit_ids)
                 last_exception = None
                 break

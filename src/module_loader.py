@@ -140,10 +140,12 @@ def _resolve_normal_step(step: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _resolve_llm_step(step: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_llm_step(step: Dict[str, Any], pipeline_path: str) -> Dict[str, Any]:
+    llm_config = dict(step)
+    llm_config["_anchor_path"] = pipeline_path
     return {
         "kind": "llm",
-        "config": step,
+        "config": llm_config,
     }
 
 
@@ -156,7 +158,7 @@ def load_pipeline(pipeline_path: str) -> Dict[str, Any]:
     loaded_steps = []
     for step in config["steps"]:
         if step.get("type") == "llm":
-            loaded_steps.append(_resolve_llm_step(step))
+            loaded_steps.append(_resolve_llm_step(step, pipeline_path))
         else:
             loaded_steps.append(_resolve_normal_step(step))
 
