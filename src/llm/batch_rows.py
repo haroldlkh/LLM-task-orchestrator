@@ -1,16 +1,8 @@
 import json
 
 from .models import LLMProgressRecord, LLMResultRecord
+from .runtime import current_retry_count
 from .state import utc_now_iso
-
-
-def _current_retry_count(progress_df, unit_id: str) -> int:
-    if progress_df is None or progress_df.is_empty():
-        return 0
-    rows = progress_df.filter(progress_df["unit_id"] == unit_id)
-    if rows.is_empty():
-        return 0
-    return int(rows["retry_count"].to_list()[-1])
 
 
 def _serialize_jsonish(value):
@@ -31,70 +23,47 @@ def _serialize_output_value(value):
     return str(value)
 
 
-def _iter_output_records(unit, parsed, request_result, review_flag, review_reason):
-    """
-    Supports either:
-    - legacy single-output shape via parsed['output_value']
-    - multi-output shape via parsed['extra_outputs'] = {column_name: value, ...}
-    """
-    base_output_column = unit["output_column"]
-    base_output_value = parsed.get("output_value")
+def _iter_result_records(unit, parsed, request_result, review_flag, review_reason):
+    yield LLMResultRecord(
+        unit_id=unit["unit_id"],
+        row_id=unit["row_id"],
+        output_column=unit["output_column"],
+        status="success",
+        parsed_output=_serialize_jsonish(parsed.get("parsed_output")),
+        output_value=_serialize_output_value(parsed.get("output_value")),
+        raw_output=_serialize_jsonish(request_result.get("raw_output")),
+        error_type=parsed.get("error_type"),
+        error_message=parsed.get("error_message"),
+        review_flag=review_flag,
+        review_reason=review_reason,
+    ).to_dict()
 
-    yielded_any = False
-
-    if parsed["status"] == "success":
+    extra_outputs = parsed.get("extra_outputs") or parsed.get("extra_output_values") or {}
+    for output_column, output_value in extra_outputs.items():
         yield LLMResultRecord(
             unit_id=unit["unit_id"],
             row_id=unit["row_id"],
-            output_column=base_output_column,
+            output_column=output_column,
             status="success",
             parsed_output=_serialize_jsonish(parsed.get("parsed_output")),
-            output_value=_serialize_output_value(base_output_value),
+            output_value=_serialize_output_value(output_value),
             raw_output=_serialize_jsonish(request_result.get("raw_output")),
             error_type=parsed.get("error_type"),
             error_message=parsed.get("error_message"),
             review_flag=review_flag,
             review_reason=review_reason,
         ).to_dict()
-        yielded_any = True
-
-        extra_outputs = parsed.get("extra_outputs") or parsed.get("extra_output_values") or {}
-        for extra_output_column, extra_output_value in extra_outputs.items():
-            yield LLMResultRecord(
-                unit_id=unit["unit_id"],
-                row_id=unit["row_id"],
-                output_column=extra_output_column,
-                status="success",
-                parsed_output=_serialize_jsonish(parsed.get("parsed_output")),
-                output_value=_serialize_output_value(extra_output_value),
-                raw_output=_serialize_jsonish(request_result.get("raw_output")),
-                error_type=parsed.get("error_type"),
-                error_message=parsed.get("error_message"),
-                review_flag=review_flag,
-                review_reason=review_reason,
-            ).to_dict()
-            yielded_any = True
-
-    if not yielded_any:
-        return
 
 
-def mark_group_transport_failure(
-    group_units,
-    request,
-    request_result,
-    progress_df,
-    request_attempt_count,
-):
+def mark_group_transport_failure(group_units, request, request_result, progress_df, request_attempt_count):
     now = utc_now_iso()
     progress_rows = []
     debug_rows = []
-
     request_group_id = request.get("request_id")
     request_group_size = len(group_units)
 
     for unit in group_units:
-        retry_count = _current_retry_count(progress_df, unit["unit_id"])
+        retry_count = current_retry_count(progress_df, unit["unit_id"])
         if request_result["status"] == "retryable_error":
             retry_count += 1
 
@@ -108,7 +77,6 @@ def mark_group_transport_failure(
                 updated_at=now,
             ).to_dict()
         )
-
         debug_rows.append(
             {
                 "unit_id": unit["unit_id"],
@@ -131,29 +99,18 @@ def mark_group_transport_failure(
                 "updated_at": now,
             }
         )
-
     return progress_rows, debug_rows
 
 
-def mark_group_parse_failure(
-    group_units,
-    request,
-    raw_output,
-    error_type,
-    error_message,
-    progress_df,
-    request_attempt_count,
-):
+def mark_group_parse_failure(group_units, request, raw_output, error_type, error_message, progress_df, request_attempt_count):
     now = utc_now_iso()
     progress_rows = []
     debug_rows = []
-
     request_group_id = request.get("request_id")
     request_group_size = len(group_units)
 
     for unit in group_units:
-        retry_count = _current_retry_count(progress_df, unit["unit_id"]) + 1
-
+        retry_count = current_retry_count(progress_df, unit["unit_id"]) + 1
         progress_rows.append(
             LLMProgressRecord(
                 unit_id=unit["unit_id"],
@@ -164,7 +121,6 @@ def mark_group_parse_failure(
                 updated_at=now,
             ).to_dict()
         )
-
         debug_rows.append(
             {
                 "unit_id": unit["unit_id"],
@@ -187,31 +143,21 @@ def mark_group_parse_failure(
                 "updated_at": now,
             }
         )
-
     return progress_rows, debug_rows
 
 
-def build_rows_from_group_parse(
-    group_units,
-    request,
-    request_result,
-    parse_results,
-    progress_df,
-    request_attempt_count,
-):
+def build_rows_from_group_parse(group_units, request, request_result, parse_results, progress_df, request_attempt_count):
     now = utc_now_iso()
     progress_rows = []
     result_rows = []
     debug_rows = []
-
     parse_lookup = {row["unit_id"]: row for row in parse_results}
     request_group_id = request.get("request_id")
     request_group_size = len(group_units)
 
     for unit in group_units:
         parsed = parse_lookup[unit["unit_id"]]
-
-        retry_count = _current_retry_count(progress_df, unit["unit_id"])
+        retry_count = current_retry_count(progress_df, unit["unit_id"])
         if parsed["status"] == "retryable_error":
             retry_count += 1
 
@@ -258,15 +204,7 @@ def build_rows_from_group_parse(
 
         if parsed["status"] == "success":
             result_rows.extend(
-                list(
-                    _iter_output_records(
-                        unit=unit,
-                        parsed=parsed,
-                        request_result=request_result,
-                        review_flag=review_flag,
-                        review_reason=review_reason,
-                    )
-                )
+                list(_iter_result_records(unit, parsed, request_result, review_flag, review_reason))
             )
 
     return progress_rows, result_rows, debug_rows
