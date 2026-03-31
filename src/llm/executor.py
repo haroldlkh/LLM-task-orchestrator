@@ -28,9 +28,11 @@ from .runtime import (
     validate_llm_step,
 )
 from .state import (
+    cleanup_llm_artifacts,
     ensure_llm_state_layout,
     upload_versioned_json,
     upload_versioned_parquet,
+    utc_now_run_id,
 )
 from .work_units import build_work_units
 
@@ -117,13 +119,14 @@ def _progress_snapshot_outcome(
     )
 
 
-def _upload_manifest(connector, folders: dict, temp_dir: str, work_units_df: pl.DataFrame):
+def _upload_manifest(connector, folders: dict, temp_dir: str, work_units_df: pl.DataFrame, run_id: str):
     upload_versioned_parquet(
         connector=connector,
         location=folders["state_folder"],
         prefix="manifest",
         df=work_units_df,
         temp_dir=temp_dir,
+        run_id=run_id,
     )
 
 
@@ -138,6 +141,7 @@ def _flush_incremental_state(
     partial_output_df: pl.DataFrame,
     metadata: dict,
     runtime: dict,
+    run_id: str,
 ):
     upload_versioned_parquet(
         connector=connector,
@@ -145,6 +149,7 @@ def _flush_incremental_state(
         prefix="progress",
         df=ensure_progress_df(progress_df),
         temp_dir=temp_dir,
+        run_id=run_id,
     )
 
     if result_rows:
@@ -154,6 +159,7 @@ def _flush_incremental_state(
             prefix="results",
             df=result_rows_to_df(result_rows),
             temp_dir=temp_dir,
+            run_id=run_id,
         )
 
     if debug_rows:
@@ -164,6 +170,7 @@ def _flush_incremental_state(
             prefix="traces",
             df=debug_df,
             temp_dir=temp_dir,
+            run_id=run_id,
         )
         review_df = debug_df.filter(
             (pl.col("status") != "success") | (pl.col("review_flag") == True)
@@ -175,6 +182,7 @@ def _flush_incremental_state(
                 prefix="review",
                 df=review_df,
                 temp_dir=temp_dir,
+                run_id=run_id,
             )
 
     if runtime["write_pair_status"] and pair_status_df is not None and not pair_status_df.is_empty():
@@ -184,6 +192,7 @@ def _flush_incremental_state(
             prefix="pair_status",
             df=pair_status_df,
             temp_dir=temp_dir,
+            run_id=run_id,
         )
 
     if (
@@ -197,6 +206,7 @@ def _flush_incremental_state(
             prefix="partial_output",
             df=partial_output_df,
             temp_dir=temp_dir,
+            run_id=run_id,
         )
 
     upload_versioned_json(
@@ -205,6 +215,7 @@ def _flush_incremental_state(
         prefix="metadata",
         payload=metadata,
         temp_dir=temp_dir,
+        run_id=run_id,
     )
 
 
@@ -215,6 +226,7 @@ def _flush_final_state(
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
     metadata: dict,
+    run_id: str,
 ):
     upload_versioned_parquet(
         connector=connector,
@@ -222,6 +234,7 @@ def _flush_final_state(
         prefix="manifest",
         df=work_units_df,
         temp_dir=temp_dir,
+        run_id=run_id,
     )
     upload_versioned_parquet(
         connector=connector,
@@ -229,6 +242,7 @@ def _flush_final_state(
         prefix="progress",
         df=ensure_progress_df(progress_df),
         temp_dir=temp_dir,
+        run_id=run_id,
     )
     upload_versioned_json(
         connector=connector,
@@ -236,6 +250,7 @@ def _flush_final_state(
         prefix="metadata",
         payload=metadata,
         temp_dir=temp_dir,
+        run_id=run_id,
     )
 
 
@@ -244,6 +259,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     source_df = data.collect(streaming=True) if isinstance(data, pl.LazyFrame) else data
     runtime = default_runtime(step_config)
     source_df = apply_input_row_window(source_df, runtime)
+    run_id = utc_now_run_id()
 
     pipeline_name = runtime_context["pipeline_name"]
     workflow_location = runtime_context["dest_location"]
@@ -294,7 +310,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         flush=True,
     )
 
-    _upload_manifest(dest_connector, folders, temp_dir, work_units_df)
+    _upload_manifest(dest_connector, folders, temp_dir, work_units_df, run_id)
 
     if pending_units_df.is_empty():
         outcome = _progress_snapshot_outcome(
@@ -304,7 +320,9 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
         metadata = build_runtime_metadata(step_config, work_units_df, progress_df, outcome)
         metadata["workflow_folder"] = pipeline_name
-        _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata)
+        _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
+        cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
+        print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
         return merge_results_back(
             source_df,
             all_results_df,
@@ -365,6 +383,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             partial_output_df,
             metadata,
             runtime,
+            run_id,
         )
         return {"counted_flush": True}
 
@@ -413,8 +432,12 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         partial_output_df,
         metadata,
         runtime,
+        run_id,
     )
-    _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata)
+    _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
+
+    cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
+    print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
     final_merged = merge_results_back(
         source_df,

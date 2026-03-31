@@ -72,6 +72,11 @@ def default_runtime(step_config: dict) -> dict:
         "shared_failure_window_seconds": float(runtime.get("shared_failure_window_seconds", 90)),
         "shared_failure_lane_threshold": int(runtime.get("shared_failure_lane_threshold", 2)),
         "allow_spillover_when_tpm_blocked": bool(runtime.get("allow_spillover_when_tpm_blocked", True)),
+        "artifact_retention_mode": runtime.get("artifact_retention_mode", "standard"),
+        "keep_last_flushes": int(runtime.get("keep_last_flushes", 3)),
+        "keep_last_final_outputs": int(runtime.get("keep_last_final_outputs", 3)),
+        "keep_last_runs": int(runtime.get("keep_last_runs", 10)),
+        "keep_all_flushes_within_kept_runs": bool(runtime.get("keep_all_flushes_within_kept_runs", True)),
     }
     merged.update({key: runtime.get(key, default) for key, default in TPM_RUNTIME_DEFAULTS.items()})
     return merged
@@ -198,6 +203,14 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'shared_failure_window_seconds' must be >= 0")
     if runtime["shared_failure_lane_threshold"] < 1:
         raise ValueError("LLM runtime 'shared_failure_lane_threshold' must be >= 1")
+    if runtime["artifact_retention_mode"] not in {"standard", "debug"}:
+        raise ValueError("LLM runtime 'artifact_retention_mode' must be one of {'standard', 'debug'}")
+    if runtime["keep_last_flushes"] < 1:
+        raise ValueError("LLM runtime 'keep_last_flushes' must be >= 1")
+    if runtime["keep_last_final_outputs"] < 1:
+        raise ValueError("LLM runtime 'keep_last_final_outputs' must be >= 1")
+    if runtime["keep_last_runs"] < 1:
+        raise ValueError("LLM runtime 'keep_last_runs' must be >= 1")
 
     if runtime["target_tokens_per_minute"] is not None:
         if float(runtime["target_tokens_per_minute"]) <= 0:

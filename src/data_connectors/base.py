@@ -19,6 +19,10 @@ class BaseConnector(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def delete_object(self, object_id: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def ensure_subdir(self, parent_location: str, name: str) -> str:
         """
         Ensure a child directory/folder exists under parent_location.

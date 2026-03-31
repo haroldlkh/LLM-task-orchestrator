@@ -144,6 +144,14 @@ class GDriveConnector(BaseConnector):
 
         return result["id"]
 
+
+    def delete_object(self, object_id: str):
+        self.service.files().update(
+            fileId=object_id,
+            body={"trashed": True},
+            supportsAllDrives=True,
+        ).execute()
+
     def ensure_subdir(self, parent_location: str, name: str) -> str:
         query = (
             f"'{parent_location}' in parents "

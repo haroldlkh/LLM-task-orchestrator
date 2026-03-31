@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -8,6 +9,10 @@ import polars as pl
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def utc_now_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def sanitize_name(name: str) -> str:
@@ -78,15 +83,22 @@ def download_all_parquet_by_prefix(
     return dfs
 
 
+def _versioned_filename(prefix: str, extension: str, run_id: str | None = None) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    if run_id:
+        return f"{prefix}__run_{run_id}__{ts}.{extension}"
+    return f"{prefix}_{ts}.{extension}"
+
+
 def upload_versioned_parquet(
     connector,
     location: str,
     prefix: str,
     df: pl.DataFrame,
     temp_dir: str,
+    run_id: str | None = None,
 ) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"{prefix}_{ts}.parquet"
+    filename = _versioned_filename(prefix, "parquet", run_id=run_id)
     local_path = os.path.join(temp_dir, filename)
     df.write_parquet(local_path)
     connector.upload_object(local_path, location, filename)
@@ -100,12 +112,113 @@ def upload_versioned_json(
     prefix: str,
     payload: dict,
     temp_dir: str,
+    run_id: str | None = None,
 ) -> str:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"{prefix}_{ts}.json"
+    filename = _versioned_filename(prefix, "json", run_id=run_id)
     local_path = os.path.join(temp_dir, filename)
     with open(local_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     connector.upload_object(local_path, location, filename)
     os.remove(local_path)
     return filename
+
+
+def _run_id_from_name(name: str) -> str | None:
+    match = re.search(r"__run_(\d{8}_\d{6})__", name)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _prune_keep_last_n_by_prefix(connector, location: str, prefix: str, keep_last_n: int) -> int:
+    objects = [obj for obj in connector.list_objects(location) if obj["name"].startswith(prefix)]
+    objects.sort(key=lambda x: x["name"])
+    to_delete = objects[:-keep_last_n] if len(objects) > keep_last_n else []
+    for obj in to_delete:
+        connector.delete_object(obj["id"])
+    return len(to_delete)
+
+
+def _prune_final_outputs(connector, workflow_location: str, keep_last_n: int) -> int:
+    objects = [obj for obj in connector.list_objects(workflow_location) if obj["name"].endswith('.parquet')]
+    objects.sort(key=lambda x: x["name"])
+    to_delete = objects[:-keep_last_n] if len(objects) > keep_last_n else []
+    for obj in to_delete:
+        connector.delete_object(obj["id"])
+    return len(to_delete)
+
+
+def _group_objects_by_run_id(objects: List[Dict], prefixes: List[str]) -> Dict[str, List[Dict]]:
+    grouped: Dict[str, List[Dict]] = {}
+    for obj in objects:
+        if not any(obj["name"].startswith(prefix) for prefix in prefixes):
+            continue
+        run_id = _run_id_from_name(obj["name"])
+        if run_id is None:
+            continue
+        grouped.setdefault(run_id, []).append(obj)
+    return grouped
+
+
+def _prune_debug_runs(connector, folders: Dict[str, str], keep_last_runs: int) -> int:
+    folder_prefixes = {
+        "state_folder": ["manifest", "progress", "metadata"],
+        "results_folder": ["results", "partial_output"],
+        "debug_folder": ["traces", "review", "pair_status"],
+    }
+    run_ids = set()
+    grouped_by_folder = {}
+    for folder_key, prefixes in folder_prefixes.items():
+        objs = connector.list_objects(folders[folder_key])
+        grouped = _group_objects_by_run_id(objs, prefixes)
+        grouped_by_folder[folder_key] = grouped
+        run_ids.update(grouped.keys())
+
+    keep_ids = set(sorted(run_ids)[-keep_last_runs:])
+    deleted = 0
+    for folder_key, grouped in grouped_by_folder.items():
+        for run_id, objs in grouped.items():
+            if run_id in keep_ids:
+                continue
+            for obj in objs:
+                connector.delete_object(obj["id"])
+                deleted += 1
+    return deleted
+
+
+def cleanup_llm_artifacts(
+    connector,
+    folders: Dict[str, str],
+    runtime: dict,
+) -> Dict[str, int]:
+    mode = runtime.get("artifact_retention_mode", "standard")
+    deleted = {"final_outputs": 0, "artifacts": 0}
+
+    deleted["final_outputs"] = _prune_final_outputs(
+        connector=connector,
+        workflow_location=folders["workflow_folder"],
+        keep_last_n=int(runtime.get("keep_last_final_outputs", 3)),
+    )
+
+    if mode == "standard":
+        keep_last_n = int(runtime.get("keep_last_flushes", 3))
+        for folder_key, prefixes in {
+            "state_folder": ["manifest", "progress", "metadata"],
+            "results_folder": ["results", "partial_output"],
+            "debug_folder": ["traces", "review", "pair_status"],
+        }.items():
+            for prefix in prefixes:
+                deleted["artifacts"] += _prune_keep_last_n_by_prefix(
+                    connector=connector,
+                    location=folders[folder_key],
+                    prefix=prefix,
+                    keep_last_n=keep_last_n,
+                )
+    else:
+        deleted["artifacts"] = _prune_debug_runs(
+            connector=connector,
+            folders=folders,
+            keep_last_runs=int(runtime.get("keep_last_runs", 10)),
+        )
+
+    return deleted
