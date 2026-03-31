@@ -22,6 +22,9 @@ from .validators import (
 )
 
 
+TERMINAL_STATUSES = {"success", "permanent_error"}
+
+
 def _estimate_request_tokens(request: dict, group_units, runtime: dict) -> int:
     chars_per_token = float(runtime.get("token_estimation_chars_per_token", 4.0) or 4.0)
     response_tokens_per_unit = float(runtime.get("estimated_response_tokens_per_unit", 24) or 24)
@@ -235,6 +238,22 @@ def _sleep_between_waves(step_name: str, seconds: float, reason: str) -> None:
     time.sleep(seconds)
 
 
+def _latest_statuses(progress_by_unit: dict) -> dict[str, str]:
+    return {
+        unit_id: (row.get("status") if isinstance(row, dict) else None)
+        for unit_id, row in progress_by_unit.items()
+    }
+
+
+def _remaining_units_from_statuses(progress_by_unit: dict, total_units: int) -> int:
+    statuses = _latest_statuses(progress_by_unit)
+    terminal_count = sum(1 for status in statuses.values() if status in TERMINAL_STATUSES)
+    attempted_count = len(statuses)
+    untouched_count = max(total_units - attempted_count, 0)
+    retryable_count = sum(1 for status in statuses.values() if status not in TERMINAL_STATUSES)
+    return untouched_count + retryable_count
+
+
 def process_batches(
     pending_rows,
     step_config,
@@ -364,12 +383,15 @@ def process_batches(
 
         if last_exception is not None:
             for item in wave:
-                progress_rows, debug_rows = mark_group_parse_failure(
+                progress_rows, debug_rows = mark_group_transport_failure(
                     group_units=item["group_units"],
                     request=item["request"],
-                    raw_output=None,
-                    error_type="wave_request_exception",
-                    error_message=str(last_exception),
+                    request_result={
+                        "status": "retryable_error",
+                        "raw_output": None,
+                        "error_type": "wave_request_exception",
+                        "error_message": str(last_exception),
+                    },
                     progress_df=progress_df,
                     request_attempt_count=wave_attempt_count,
                 )
@@ -502,10 +524,7 @@ def process_batches(
 
                     wave_metrics["useful_work"] += useful_work
                     wave_metrics["failure_units"] += failure_units
-                    if useful_work > 0:
-                        wave_metrics["successful_requests"] += 1
-                    if failure_rate >= 1.0:
-                        wave_metrics["transport_failures"] += 1
+                    wave_metrics["successful_requests"] += 1
 
                     print(
                         (
@@ -540,7 +559,6 @@ def process_batches(
                     units_since_flush += group_len
 
                     wave_metrics["failure_units"] += group_len
-                    wave_metrics["transport_failures"] += 1
 
                     print(
                         (
@@ -595,7 +613,7 @@ def process_batches(
                     "result_rows": list(pending_result_rows),
                     "debug_rows": list(pending_debug_rows),
                     "processed_units": processed_count,
-                    "remaining_units": max(total_units - cursor, 0),
+                    "remaining_units": _remaining_units_from_statuses(progress_by_unit, total_units),
                     "current_group_size": derive_group_size(
                         controller.load_budget,
                         controller.concurrency,
@@ -656,7 +674,7 @@ def process_batches(
                 "result_rows": list(pending_result_rows),
                 "debug_rows": list(pending_debug_rows),
                 "processed_units": processed_count,
-                "remaining_units": max(total_units - cursor, 0),
+                "remaining_units": _remaining_units_from_statuses(progress_by_unit, total_units),
                 "current_group_size": derive_group_size(
                     controller.load_budget,
                     controller.concurrency,
@@ -670,7 +688,7 @@ def process_batches(
         if flush_payload and flush_payload.get("counted_flush"):
             completed_flushes += 1
 
-    remaining_units = max(total_units - processed_count, 0)
+    remaining_units = _remaining_units_from_statuses(progress_by_unit, total_units)
     outcome = LLMRunOutcome(
         status="complete" if remaining_units == 0 else "retryable_incomplete",
         processed_units=processed_count,
