@@ -260,7 +260,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     provider_config = user_runtime_config[provider_config_key]
     adapter = build_adapter(step_config["adapter"], provider_config)
 
-    pool_size = int(getattr(adapter, "pool_size", 1) or 1)
+    pool_size = int(getattr(adapter, "lane_count", getattr(adapter, "pool_size", 1)) or 1)
     if pool_size > 1:
         runtime["initial_concurrency"] = max(runtime["initial_concurrency"], min(pool_size, runtime["max_concurrent_requests"]))
         runtime["max_concurrent_requests"] = max(runtime["max_concurrent_requests"], pool_size)

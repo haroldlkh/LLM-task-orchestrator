@@ -332,7 +332,11 @@ def process_batches(
                 )
                 if selected is None:
                     break
-                lane, group_units, request, estimated_tokens = selected
+
+                lane = selected["lane"]
+                group_units = selected["group_units"]
+                request = selected["request"]
+                estimated_tokens = selected["estimated_tokens"]
                 for _ in range(len(group_units)):
                     pending_queue.popleft()
                 attempted_dispatch_units += len(group_units)

@@ -24,6 +24,10 @@ class ProviderPoolAdapter:
     def lane_count(self) -> int:
         return len(self.lanes)
 
+    @property
+    def pool_size(self) -> int:
+        return len(self.lanes)
+
     def get_lane(self, key_alias: str) -> ProviderLane:
         for lane in self.lanes:
             if lane.key_alias == key_alias:

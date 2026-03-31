@@ -66,7 +66,7 @@ def default_runtime(step_config: dict) -> dict:
         "input_row_offset": int(runtime.get("input_row_offset", 0)),
         "lane_strategy": runtime.get("lane_strategy", "hybrid"),
         "initial_active_lanes": int(runtime.get("initial_active_lanes", 1)),
-        "max_active_lanes": int(runtime.get("max_active_lanes", max_concurrent_requests)),
+        "max_active_lanes": int(runtime.get("max_active_lanes", 999999)),
         "lane_exploration_success_waves": int(runtime.get("lane_exploration_success_waves", 2)),
         "lane_reduction_cooldown_waves": int(runtime.get("lane_reduction_cooldown_waves", 2)),
         "shared_failure_window_seconds": float(runtime.get("shared_failure_window_seconds", 90)),
