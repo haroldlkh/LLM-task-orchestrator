@@ -190,15 +190,17 @@ def cleanup_llm_artifacts(
     connector,
     folders: Dict[str, str],
     runtime: dict,
+    include_final_outputs: bool = True,
 ) -> Dict[str, int]:
     mode = runtime.get("artifact_retention_mode", "standard")
     deleted = {"final_outputs": 0, "artifacts": 0}
 
-    deleted["final_outputs"] = _prune_final_outputs(
-        connector=connector,
-        workflow_location=folders["workflow_folder"],
-        keep_last_n=int(runtime.get("keep_last_final_outputs", 3)),
-    )
+    if include_final_outputs:
+        deleted["final_outputs"] = _prune_final_outputs(
+            connector=connector,
+            workflow_location=folders["workflow_folder"],
+            keep_last_n=int(runtime.get("keep_last_final_outputs", 3)),
+        )
 
     if mode == "standard":
         keep_last_n = int(runtime.get("keep_last_flushes", 3))

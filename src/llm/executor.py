@@ -385,6 +385,17 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             runtime,
             run_id,
         )
+        if runtime.get("artifact_retention_mode", "standard") == "standard":
+            cleanup_summary = cleanup_llm_artifacts(
+                dest_connector,
+                folders,
+                runtime,
+                include_final_outputs=False,
+            )
+            print(
+                f"[llm:{step_config['name']}] cleanup_flush artifacts_deleted={cleanup_summary['artifacts']}",
+                flush=True,
+            )
         return {"counted_flush": True}
 
     batch_out = process_batches(
