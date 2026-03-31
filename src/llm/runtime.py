@@ -13,6 +13,8 @@ TPM_RUNTIME_DEFAULTS = {
     "max_sleep_to_respect_tpm_seconds": 120,
 }
 
+LANE_STRATEGIES = {"hybrid", "safe_single_active"}
+
 
 def default_runtime(step_config: dict) -> dict:
     runtime = step_config.get("runtime", {})
@@ -64,6 +66,14 @@ def default_runtime(step_config: dict) -> dict:
         "write_pair_status": bool(runtime.get("write_pair_status", False)),
         "input_row_limit": runtime.get("input_row_limit"),
         "input_row_offset": int(runtime.get("input_row_offset", 0)),
+        "lane_strategy": runtime.get("lane_strategy", "hybrid"),
+        "initial_active_lanes": int(runtime.get("initial_active_lanes", 1)),
+        "max_active_lanes": runtime.get("max_active_lanes"),
+        "lane_exploration_success_waves": int(runtime.get("lane_exploration_success_waves", 2)),
+        "lane_reduction_cooldown_waves": int(runtime.get("lane_reduction_cooldown_waves", 2)),
+        "shared_failure_window_seconds": float(runtime.get("shared_failure_window_seconds", 90)),
+        "shared_failure_lane_threshold": int(runtime.get("shared_failure_lane_threshold", 2)),
+        "allow_spillover_when_tpm_blocked": bool(runtime.get("allow_spillover_when_tpm_blocked", True)),
     }
     merged.update({key: runtime.get(key, default) for key, default in TPM_RUNTIME_DEFAULTS.items()})
     return merged
@@ -146,16 +156,18 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'load_shrink_factor' must be > 0 and < 1")
     if runtime["mild_load_shrink_factor"] <= 0 or runtime["mild_load_shrink_factor"] >= 1:
         raise ValueError("LLM runtime 'mild_load_shrink_factor' must be > 0 and < 1")
-    if runtime["concurrency_growth_cooldown_waves"] < 1:
-        raise ValueError("LLM runtime 'concurrency_growth_cooldown_waves' must be >= 1")
-    if runtime["concurrency_shrink_cooldown_waves"] < 1:
-        raise ValueError("LLM runtime 'concurrency_shrink_cooldown_waves' must be >= 1")
+    if runtime["concurrency_growth_cooldown_waves"] < 0:
+        raise ValueError("LLM runtime 'concurrency_growth_cooldown_waves' must be >= 0")
+    if runtime["concurrency_shrink_cooldown_waves"] < 0:
+        raise ValueError("LLM runtime 'concurrency_shrink_cooldown_waves' must be >= 0")
     if runtime["flush_every_n_units"] < 1:
         raise ValueError("LLM runtime 'flush_every_n_units' must be >= 1")
     if runtime["flush_every_n_groups"] < 1:
         raise ValueError("LLM runtime 'flush_every_n_groups' must be >= 1")
     if runtime["flush_every_n_seconds"] < 1:
         raise ValueError("LLM runtime 'flush_every_n_seconds' must be >= 1")
+    if runtime["max_flushes_per_run"] is not None and int(runtime["max_flushes_per_run"]) < 1:
+        raise ValueError("LLM runtime 'max_flushes_per_run' must be >= 1 when provided")
     if runtime["log_every_n_groups"] < 1:
         raise ValueError("LLM runtime 'log_every_n_groups' must be >= 1")
     if runtime["soft_time_limit_minutes"] <= 0:
@@ -172,6 +184,20 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'all_transport_failure_cooldown_seconds' must be >= 0")
     if runtime["flush_scope"] not in {"unit", "row_complete"}:
         raise ValueError("LLM runtime 'flush_scope' must be one of {'unit', 'row_complete'}")
+    if runtime["lane_strategy"] not in LANE_STRATEGIES:
+        raise ValueError(f"LLM runtime 'lane_strategy' must be one of {sorted(LANE_STRATEGIES)}")
+    if runtime["initial_active_lanes"] < 1:
+        raise ValueError("LLM runtime 'initial_active_lanes' must be >= 1")
+    if runtime["max_active_lanes"] is not None and int(runtime["max_active_lanes"]) < 1:
+        raise ValueError("LLM runtime 'max_active_lanes' must be >= 1 when provided")
+    if runtime["lane_exploration_success_waves"] < 1:
+        raise ValueError("LLM runtime 'lane_exploration_success_waves' must be >= 1")
+    if runtime["lane_reduction_cooldown_waves"] < 0:
+        raise ValueError("LLM runtime 'lane_reduction_cooldown_waves' must be >= 0")
+    if runtime["shared_failure_window_seconds"] < 0:
+        raise ValueError("LLM runtime 'shared_failure_window_seconds' must be >= 0")
+    if runtime["shared_failure_lane_threshold"] < 1:
+        raise ValueError("LLM runtime 'shared_failure_lane_threshold' must be >= 1")
 
     if runtime["target_tokens_per_minute"] is not None:
         if float(runtime["target_tokens_per_minute"]) <= 0:

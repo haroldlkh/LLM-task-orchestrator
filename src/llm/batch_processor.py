@@ -136,32 +136,108 @@ def _lane_next_available_delay(lane: dict, runtime: dict, queue_snapshot, step_c
     return delay
 
 
-def _select_dispatch_lane(lanes, runtime, pending_queue, step_config, task_handler, prompt_context):
-    now = time.time()
-    candidates = []
-    queue_snapshot = list(pending_queue)
-    for lane in lanes:
-        if lane["in_flight"]:
-            continue
-        group_size = derive_group_size(
-            lane["controller"].load_budget,
-            lane["controller"].concurrency,
-            runtime["min_group_size"],
-            runtime["max_group_size"],
-        )
-        group_units, request = _build_group_request(queue_snapshot, group_size, step_config, task_handler, prompt_context)
-        if not group_units:
-            continue
-        estimated_tokens = _estimate_request_tokens(request, group_units, runtime)
-        tpm_delay = _lane_wait_seconds_for_tpm(runtime, lane["token_window"], estimated_tokens, now)
-        cooldown_delay = max(0.0, lane["cooldown_until"] - now)
-        if tpm_delay > 0 or cooldown_delay > 0:
-            continue
-        candidates.append((lane, group_units, request, estimated_tokens))
-    if not candidates:
+def _lane_is_ready(lane: dict, runtime: dict, queue_snapshot, step_config, task_handler, prompt_context, now: float):
+    if lane["in_flight"]:
         return None
-    candidates.sort(key=lambda item: _lane_health_key(item[0]), reverse=True)
-    return candidates[0]
+    group_size = derive_group_size(
+        lane["controller"].load_budget,
+        lane["controller"].concurrency,
+        runtime["min_group_size"],
+        runtime["max_group_size"],
+    )
+    group_units, request = _build_group_request(queue_snapshot, group_size, step_config, task_handler, prompt_context)
+    if not group_units:
+        return None
+    estimated_tokens = _estimate_request_tokens(request, group_units, runtime)
+    tpm_delay = _lane_wait_seconds_for_tpm(runtime, lane["token_window"], estimated_tokens, now)
+    cooldown_delay = max(0.0, lane["cooldown_until"] - now)
+    return {
+        "lane": lane,
+        "group_units": group_units,
+        "request": request,
+        "estimated_tokens": estimated_tokens,
+        "ready": tpm_delay <= 0 and cooldown_delay <= 0,
+        "tpm_delay": tpm_delay,
+        "cooldown_delay": cooldown_delay,
+    }
+
+
+def _shared_transport_failure_active(shared_failure_events: deque, runtime: dict, now: float) -> bool:
+    window = float(runtime.get("shared_failure_window_seconds", 90) or 90)
+    threshold = int(runtime.get("shared_failure_lane_threshold", 2) or 2)
+    cutoff = now - window
+    while shared_failure_events and shared_failure_events[0][0] < cutoff:
+        shared_failure_events.popleft()
+    distinct_lanes = {lane_key for _, lane_key in shared_failure_events}
+    return len(distinct_lanes) >= threshold
+
+
+def _maybe_expand_lane_limit(strategy_state: dict, runtime: dict, lane_count: int, now: float) -> None:
+    if strategy_state["mode"] != "hybrid":
+        return
+    max_active = min(int(runtime.get("max_active_lanes") or lane_count), lane_count)
+    if strategy_state["active_lane_limit"] >= max_active:
+        return
+    if now < strategy_state["next_expand_allowed_at"]:
+        return
+    if strategy_state["healthy_wave_streak"] < int(runtime.get("lane_exploration_success_waves", 2) or 2):
+        return
+    strategy_state["active_lane_limit"] += 1
+    strategy_state["healthy_wave_streak"] = 0
+
+
+def _reduce_lane_limit(strategy_state: dict, runtime: dict, now: float) -> None:
+    reduction_cooldown = int(runtime.get("lane_reduction_cooldown_waves", 2) or 2)
+    strategy_state["active_lane_limit"] = max(1, strategy_state["active_lane_limit"] - 1)
+    strategy_state["healthy_wave_streak"] = 0
+    strategy_state["next_expand_allowed_at"] = now + reduction_cooldown
+
+
+def _select_dispatch_lane(lanes, runtime, pending_queue, step_config, task_handler, prompt_context, strategy_state):
+    now = time.time()
+    queue_snapshot = list(pending_queue)
+    lane_infos = []
+    for lane in lanes:
+        info = _lane_is_ready(lane, runtime, queue_snapshot, step_config, task_handler, prompt_context, now)
+        if info is not None:
+            lane_infos.append(info)
+
+    if not lane_infos:
+        return None
+
+    lane_infos.sort(key=lambda item: _lane_health_key(item["lane"]), reverse=True)
+    ready_infos = [info for info in lane_infos if info["ready"]]
+
+    mode = strategy_state["mode"]
+    primary_alias = strategy_state.get("primary_lane_alias")
+    if mode == "safe_single_active" and primary_alias:
+        for info in ready_infos:
+            if info["lane"]["key_alias"] == primary_alias:
+                return info
+
+    if mode == "safe_single_active":
+        return ready_infos[0] if ready_infos else None
+
+    allow_spill = bool(runtime.get("allow_spillover_when_tpm_blocked", True))
+    active_limit = strategy_state["active_lane_limit"]
+    in_flight_count = sum(1 for lane in lanes if lane["in_flight"])
+    if in_flight_count >= active_limit:
+        return None
+
+    if primary_alias:
+        for info in ready_infos:
+            if info["lane"]["key_alias"] == primary_alias:
+                return info
+
+    if ready_infos:
+        return ready_infos[0]
+
+    if allow_spill and in_flight_count == 0:
+        delayed = sorted(lane_infos, key=lambda item: max(item["tpm_delay"], item["cooldown_delay"]))
+        if delayed and max(delayed[0]["tpm_delay"], delayed[0]["cooldown_delay"]) <= 0.05:
+            return delayed[0]
+
+    return None
 
 
 def _dispatch_to_lane(executor, adapter, lane, group_units, request, estimated_tokens):
@@ -247,7 +323,19 @@ def process_batches(
             }
         )
 
+    strategy_state = {
+        "mode": runtime.get("lane_strategy", "hybrid"),
+        "active_lane_limit": 1 if runtime.get("lane_strategy", "hybrid") == "safe_single_active" else min(int(runtime.get("initial_active_lanes", 1) or 1), len(lanes)),
+        "healthy_wave_streak": 0,
+        "next_expand_allowed_at": 0.0,
+        "primary_lane_alias": lanes[0]["key_alias"] if lanes else None,
+    }
+    max_active_lanes = runtime.get("max_active_lanes")
+    if strategy_state["mode"] == "hybrid" and max_active_lanes is not None:
+        strategy_state["active_lane_limit"] = min(strategy_state["active_lane_limit"], int(max_active_lanes))
+
     active = {}
+    shared_failure_events = deque()
 
     with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as executor:
         while pending_queue or active:
@@ -255,10 +343,15 @@ def process_batches(
             dispatch_allowed = elapsed < soft_time_limit_seconds
 
             while dispatch_allowed and pending_queue:
-                selected = _select_dispatch_lane(lanes, runtime, pending_queue, step_config, task_handler, prompt_context)
+                if strategy_state["mode"] == "hybrid":
+                    _maybe_expand_lane_limit(strategy_state, runtime, len(lanes), time.time())
+                selected = _select_dispatch_lane(lanes, runtime, pending_queue, step_config, task_handler, prompt_context, strategy_state)
                 if selected is None:
                     break
-                lane, group_units, request, estimated_tokens = selected
+                lane = selected["lane"]
+                group_units = selected["group_units"]
+                request = selected["request"]
+                estimated_tokens = selected["estimated_tokens"]
                 for _ in range(len(group_units)):
                     pending_queue.popleft()
                 attempted_dispatch_units += len(group_units)
@@ -271,13 +364,14 @@ def process_batches(
                     processed_count=_terminal_units_from_statuses(progress_by_unit),
                     cursor=attempted_dispatch_units,
                     current_group_size=len(group_units),
-                    current_concurrency=1,
+                    current_concurrency=sum(1 for l in lanes if l["in_flight"]),
                     current_load_budget=lane["controller"].load_budget,
                     success_streak=lane["controller"].good_wave_streak,
                     progress_by_unit=progress_by_unit,
                     note=(
                         f"lane={lane['key_alias']} wave_start groups=1 size={len(group_units)} "
-                        f"estimated_next_wave_tokens={estimated_tokens} rolling_tokens={rolling_tokens}"
+                        f"estimated_next_wave_tokens={estimated_tokens} rolling_tokens={rolling_tokens} "
+                        f"lane_strategy={strategy_state['mode']} active_lane_limit={strategy_state['active_lane_limit']}"
                     ),
                     start_time=start_time,
                     remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
@@ -290,6 +384,7 @@ def process_batches(
                     "estimated_tokens": estimated_tokens,
                     "wave_index": wave_index,
                 }
+                strategy_state["primary_lane_alias"] = lane["key_alias"]
 
             if not active:
                 if not dispatch_allowed:
@@ -373,6 +468,13 @@ def process_batches(
                     wave_metrics["failure_units"] = group_size
                     wave_metrics["transport_failures"] = 1
                     control_notes = _update_lane_after_wave(lane, runtime, group_size, wave_metrics)
+                    now = time.time()
+                    shared_failure_events.append((now, lane["key_alias"]))
+                    if strategy_state["mode"] == "safe_single_active":
+                        strategy_state["primary_lane_alias"] = None
+                    else:
+                        if _shared_transport_failure_active(shared_failure_events, runtime, now):
+                            _reduce_lane_limit(strategy_state, runtime, now)
                     log_progress(
                         step_name=step_config["name"],
                         wave_index=context["wave_index"],
@@ -380,11 +482,11 @@ def process_batches(
                         processed_count=_terminal_units_from_statuses(progress_by_unit),
                         cursor=attempted_dispatch_units,
                         current_group_size=derive_group_size(lane["controller"].load_budget, 1, runtime["min_group_size"], runtime["max_group_size"]),
-                        current_concurrency=1,
+                        current_concurrency=sum(1 for l in lanes if l["in_flight"]),
                         current_load_budget=lane["controller"].load_budget,
                         success_streak=lane["controller"].good_wave_streak,
                         progress_by_unit=progress_by_unit,
-                        note=f"lane={lane['key_alias']} wave_complete {'|'.join(control_notes)} status={request_result['status']}",
+                        note=f"lane={lane['key_alias']} wave_complete {'|'.join(control_notes)} status={request_result['status']} lane_strategy={strategy_state['mode']} active_lane_limit={strategy_state['active_lane_limit']}",
                         start_time=start_time,
                         remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                     )
@@ -424,6 +526,11 @@ def process_batches(
                         wave_metrics["failure_units"] = failure_units
                         wave_metrics["successful_requests"] = 1
                         control_notes = _update_lane_after_wave(lane, runtime, group_size, wave_metrics)
+                        if failure_units == 0:
+                            strategy_state["healthy_wave_streak"] += 1
+                        else:
+                            strategy_state["healthy_wave_streak"] = 0
+                        strategy_state["primary_lane_alias"] = lane["key_alias"]
                         log_progress(
                             step_name=step_config["name"],
                             wave_index=context["wave_index"],
@@ -431,13 +538,14 @@ def process_batches(
                             processed_count=_terminal_units_from_statuses(progress_by_unit),
                             cursor=attempted_dispatch_units,
                             current_group_size=derive_group_size(lane["controller"].load_budget, 1, runtime["min_group_size"], runtime["max_group_size"]),
-                            current_concurrency=1,
+                            current_concurrency=sum(1 for l in lanes if l["in_flight"]),
                             current_load_budget=lane["controller"].load_budget,
                             success_streak=lane["controller"].good_wave_streak,
                             progress_by_unit=progress_by_unit,
                             note=(
                                 f"lane={lane['key_alias']} wave_complete useful_work={useful_work} "
-                                f"failure_rate={failure_units / max(group_size,1):.4f} score={request_score(useful_work, max(wave_metrics['elapsed_request_seconds'],1e-9)):.4f} {'|'.join(control_notes)}"
+                                f"failure_rate={failure_units / max(group_size,1):.4f} score={request_score(useful_work, max(wave_metrics['elapsed_request_seconds'],1e-9)):.4f} "
+                                f"{'|'.join(control_notes)} lane_strategy={strategy_state['mode']} active_lane_limit={strategy_state['active_lane_limit']}"
                             ),
                             start_time=start_time,
                             remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
@@ -465,6 +573,7 @@ def process_batches(
                         units_since_flush += group_size
                         wave_metrics["failure_units"] = group_size
                         control_notes = _update_lane_after_wave(lane, runtime, group_size, wave_metrics)
+                        strategy_state["healthy_wave_streak"] = 0
                         log_progress(
                             step_name=step_config["name"],
                             wave_index=context["wave_index"],
@@ -472,11 +581,11 @@ def process_batches(
                             processed_count=_terminal_units_from_statuses(progress_by_unit),
                             cursor=attempted_dispatch_units,
                             current_group_size=derive_group_size(lane["controller"].load_budget, 1, runtime["min_group_size"], runtime["max_group_size"]),
-                            current_concurrency=1,
+                            current_concurrency=sum(1 for l in lanes if l["in_flight"]),
                             current_load_budget=lane["controller"].load_budget,
                             success_streak=lane["controller"].good_wave_streak,
                             progress_by_unit=progress_by_unit,
-                            note=f"lane={lane['key_alias']} wave_complete group_parse_exception {'|'.join(control_notes)}",
+                            note=f"lane={lane['key_alias']} wave_complete group_parse_exception {'|'.join(control_notes)} lane_strategy={strategy_state['mode']} active_lane_limit={strategy_state['active_lane_limit']}",
                             start_time=start_time,
                             remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                         )
