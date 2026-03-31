@@ -73,7 +73,15 @@ def build_pair_status_df(
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
     step_config: dict,
+    released_row_ids: list[str] | None = None,
 ) -> pl.DataFrame:
+    """
+    Build pair-level diagnostics for rows touched so far.
+
+    The newer executor may pass released_row_ids during flush. This file accepts that
+    parameter for compatibility with the current flush path, but pair-status remains
+    a diagnostic artifact over touched rows rather than only released rows.
+    """
     if progress_df.is_empty():
         return pl.DataFrame({"row_id": []}, schema={"row_id": pl.Utf8})
 
@@ -95,8 +103,12 @@ def build_pair_status_df(
     expected = work_units_df.group_by("row_id").agg(pl.len().alias("expected_unit_count"))
     observed = touched.group_by("row_id").agg(pl.len().alias("observed_unit_count"))
     success = touched.filter(pl.col("status") == "success").group_by("row_id").agg(pl.len().alias("success_unit_count"))
-    retryable = touched.filter(pl.col("status") == "retryable_error").group_by("row_id").agg(pl.len().alias("retryable_error_count"))
-    permanent = touched.filter(pl.col("status") == "permanent_error").group_by("row_id").agg(pl.len().alias("permanent_error_count"))
+    retryable = touched.filter(pl.col("status") == "retryable_error").group_by("row_id").agg(
+        pl.len().alias("retryable_error_count")
+    )
+    permanent = touched.filter(pl.col("status") == "permanent_error").group_by("row_id").agg(
+        pl.len().alias("permanent_error_count")
+    )
 
     base = expected.join(observed, on="row_id", how="inner")
     for extra in (success, retryable, permanent):
@@ -146,10 +158,19 @@ def build_pair_status_df(
     base = base.with_columns([
         pl.concat_list([pl.col(col_name) for col_name in blocked_cols]).alias("_blocked_fields_list"),
         (pl.col("success_unit_count") == pl.col("expected_unit_count")).alias("row_success_complete"),
-        ((pl.col("success_unit_count") + pl.col("permanent_error_count")) == pl.col("expected_unit_count")).alias("row_terminal_complete"),
+        ((pl.col("success_unit_count") + pl.col("permanent_error_count")) == pl.col("expected_unit_count")).alias(
+            "row_terminal_complete"
+        ),
     ])
     base = base.with_columns(
         pl.col("_blocked_fields_list").list.eval(pl.element().drop_nulls()).list.join(",").alias("blocked_fields")
     )
+
+    if released_row_ids:
+        base = base.with_columns(
+            pl.col("row_id").is_in(released_row_ids).alias("released_in_this_flush")
+        )
+    else:
+        base = base.with_columns(pl.lit(False).alias("released_in_this_flush"))
 
     return base.drop(blocked_cols + ["_blocked_fields_list"]).sort("row_id")
