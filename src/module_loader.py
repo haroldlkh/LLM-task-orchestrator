@@ -12,6 +12,9 @@ if ENGINE_ROOT not in sys.path:
     sys.path.insert(0, ENGINE_ROOT)
 
 
+ALL_COLUMNS_SENTINELS = {"*", "all", "ALL"}
+
+
 def add_user_repo_to_path(path_in_repo: str) -> str:
     abs_path = os.path.abspath(path_in_repo)
     repo_root = abs_path.split(os.sep + "user_repo" + os.sep)[0] + os.sep + "user_repo"
@@ -68,11 +71,52 @@ def load_single_task(task_path: str) -> Dict[str, Any]:
     }
 
 
+def _normalize_pipeline_requirements(requirements: dict, pipeline_path: str) -> dict:
+    if not isinstance(requirements, dict):
+        raise ValueError(
+            f"{pipeline_path} PIPELINE_CONFIG['requirements'] must be a dict"
+        )
+
+    normalized = dict(requirements)
+    columns = normalized.get("columns")
+
+    if columns is None:
+        normalized["columns"] = []
+        return normalized
+
+    if isinstance(columns, str):
+        if columns in ALL_COLUMNS_SENTINELS:
+            normalized["columns"] = []
+            return normalized
+        raise ValueError(
+            f"{pipeline_path} PIPELINE_CONFIG['requirements']['columns'] must be a list, '*', 'all', or omitted"
+        )
+
+    if isinstance(columns, list):
+        if any(not isinstance(col, str) for col in columns):
+            raise ValueError(
+                f"{pipeline_path} PIPELINE_CONFIG['requirements']['columns'] must contain only strings"
+            )
+        if any(col in ALL_COLUMNS_SENTINELS for col in columns):
+            if len(columns) != 1:
+                raise ValueError(
+                    f"{pipeline_path} PIPELINE_CONFIG['requirements']['columns'] cannot mix '*' or 'all' with named columns"
+                )
+            normalized["columns"] = []
+            return normalized
+        normalized["columns"] = columns
+        return normalized
+
+    raise ValueError(
+        f"{pipeline_path} PIPELINE_CONFIG['requirements']['columns'] must be a list, '*', 'all', or omitted"
+    )
+
+
 def validate_pipeline_config(pipeline_module, pipeline_path: str):
     if not hasattr(pipeline_module, "PIPELINE_CONFIG"):
         raise AttributeError(f"{pipeline_path} must define PIPELINE_CONFIG")
 
-    config = pipeline_module.PIPELINE_CONFIG
+    config = dict(pipeline_module.PIPELINE_CONFIG)
 
     for key in ("name", "mode", "data_type", "requirements", "steps"):
         if key not in config:
@@ -83,12 +127,10 @@ def validate_pipeline_config(pipeline_module, pipeline_path: str):
             f"{pipeline_path} PIPELINE_CONFIG['mode'] must be 'batch' or 'global'"
         )
 
-    requirements = config["requirements"]
-    if not isinstance(requirements, dict) or "columns" not in requirements:
-        raise ValueError(
-            f"{pipeline_path} PIPELINE_CONFIG['requirements'] must be a dict "
-            f"containing a 'columns' list"
-        )
+    config["requirements"] = _normalize_pipeline_requirements(
+        config["requirements"],
+        pipeline_path,
+    )
 
     if not isinstance(config["steps"], list) or not config["steps"]:
         raise ValueError(f"{pipeline_path} PIPELINE_CONFIG['steps'] must be a non-empty list")

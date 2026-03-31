@@ -56,16 +56,12 @@ def default_runtime(step_config: dict) -> dict:
         "soft_time_limit_minutes": runtime.get("soft_time_limit_minutes", 40),
         "max_request_retries": runtime.get("max_request_retries", 3),
         "retry_backoff_seconds": runtime.get("retry_backoff_seconds", 10),
-
-        # request pacing / quota protection
         "min_inter_wave_sleep_seconds": runtime.get("min_inter_wave_sleep_seconds", 0),
         "transport_failure_cooldown_seconds": runtime.get(
-            "transport_failure_cooldown_seconds",
-            max(runtime.get("retry_backoff_seconds", 10) * 2, 10),
+            "transport_failure_cooldown_seconds", 0
         ),
         "all_transport_failure_cooldown_seconds": runtime.get(
-            "all_transport_failure_cooldown_seconds",
-            max(runtime.get("retry_backoff_seconds", 10) * 4, 20),
+            "all_transport_failure_cooldown_seconds", 0
         ),
 
         # release / artifacts
@@ -148,7 +144,6 @@ def validate_llm_step(step_config: dict):
     if runtime["max_concurrent_requests"] < 1:
         raise ValueError("LLM runtime 'max_concurrent_requests' must be >= 1")
 
-    # keep safely under the Google 8-concurrent failure zone you saw
     if runtime["max_concurrent_requests"] > 7:
         raise ValueError("LLM runtime 'max_concurrent_requests' must be <= 7")
 
@@ -192,20 +187,10 @@ def validate_llm_step(step_config: dict):
     if runtime["min_inter_wave_sleep_seconds"] < 0:
         raise ValueError("LLM runtime 'min_inter_wave_sleep_seconds' must be >= 0")
     if runtime["transport_failure_cooldown_seconds"] < 0:
-        raise ValueError(
-            "LLM runtime 'transport_failure_cooldown_seconds' must be >= 0"
-        )
+        raise ValueError("LLM runtime 'transport_failure_cooldown_seconds' must be >= 0")
     if runtime["all_transport_failure_cooldown_seconds"] < 0:
         raise ValueError(
             "LLM runtime 'all_transport_failure_cooldown_seconds' must be >= 0"
-        )
-    if (
-        runtime["all_transport_failure_cooldown_seconds"]
-        < runtime["transport_failure_cooldown_seconds"]
-    ):
-        raise ValueError(
-            "LLM runtime 'all_transport_failure_cooldown_seconds' must be >= "
-            "'transport_failure_cooldown_seconds'"
         )
 
     if runtime["flush_scope"] not in {"unit", "row_complete"}:
