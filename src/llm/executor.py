@@ -27,14 +27,18 @@ from .runtime import (
     success_or_terminal_unit_ids,
     validate_llm_step,
 )
-from .state import ensure_llm_state_layout
-from .traces import upload_versioned_json, upload_versioned_parquet
+from .state import (
+    ensure_llm_state_layout,
+    upload_versioned_json,
+    upload_versioned_parquet,
+)
 from .work_units import build_work_units
 
 
 def _load_latest_parquet(connector, folder_id: str, prefix: str, temp_dir: str):
     candidates = [
-        obj for obj in connector.list_objects(folder_id)
+        obj
+        for obj in connector.list_objects(folder_id)
         if obj["name"].endswith(".parquet") and obj["name"].startswith(prefix)
     ]
     if not candidates:
@@ -69,6 +73,7 @@ def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.
 def _merge_progress(base_progress: pl.DataFrame, new_progress: pl.DataFrame) -> pl.DataFrame:
     if base_progress.is_empty():
         return ensure_progress_df(new_progress)
+
     combined = pl.concat(
         [ensure_progress_df(base_progress), ensure_progress_df(new_progress)],
         how="vertical_relaxed",
@@ -83,6 +88,7 @@ def _merge_results(base_results: pl.DataFrame, new_results: pl.DataFrame) -> pl.
         return ensure_result_df(base_results)
     if base_results.is_empty():
         return ensure_result_df(new_results)
+
     combined = pl.concat(
         [ensure_result_df(base_results), ensure_result_df(new_results)],
         how="vertical_relaxed",
@@ -93,7 +99,6 @@ def _merge_results(base_results: pl.DataFrame, new_results: pl.DataFrame) -> pl.
 
 
 def _progress_snapshot_outcome(
-    step_config: dict,
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
     status: str,
@@ -284,7 +289,6 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
 
     if pending_units_df.is_empty():
         outcome = _progress_snapshot_outcome(
-            step_config=step_config,
             work_units_df=work_units_df,
             progress_df=progress_df,
             status="complete",
@@ -335,7 +339,6 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
 
         running_outcome = _progress_snapshot_outcome(
-            step_config=step_config,
             work_units_df=work_units_df,
             progress_df=progress_df,
             status="running",
@@ -411,12 +414,4 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         task_handler,
         step_config,
     )
-    upload_versioned_parquet(
-        connector=dest_connector,
-        location=workflow_location,
-        prefix=pipeline_name,
-        df=final_merged,
-        temp_dir=temp_dir,
-    )
-
     return final_merged
