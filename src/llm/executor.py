@@ -258,14 +258,16 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
 
     provider_config = user_runtime_config[provider_config_key]
-    adapter = build_adapter(step_config["adapter"], provider_config_key, provider_config)
+    adapter = build_adapter(step_config["adapter"], provider_config)
 
-    if hasattr(adapter, "capacity_multiplier"):
-        lane_count = int(max(getattr(adapter, "capacity_multiplier"), 1))
+    pool_size = int(getattr(adapter, "pool_size", 1) or 1)
+    if pool_size > 1:
+        runtime["initial_concurrency"] = max(runtime["initial_concurrency"], min(pool_size, runtime["max_concurrent_requests"]))
+        runtime["max_concurrent_requests"] = max(runtime["max_concurrent_requests"], pool_size)
+        runtime["initial_load_budget"] = max(runtime["initial_load_budget"], runtime["initial_group_size"] * runtime["initial_concurrency"])
         if runtime.get("target_tokens_per_minute") is not None:
-            runtime["target_tokens_per_minute"] = float(runtime["target_tokens_per_minute"]) * float(lane_count)
-        runtime["max_concurrent_requests"] = max(int(runtime["max_concurrent_requests"]), lane_count)
-        runtime["initial_concurrency"] = max(int(runtime["initial_concurrency"]), min(lane_count, int(runtime["max_concurrent_requests"])))
+            runtime["target_tokens_per_minute"] = float(runtime["target_tokens_per_minute"]) * pool_size
+
     task_handler = build_task_handler(step_config["task_handler"])
     prompt_context = load_prompt_context(step_config)
     folders = ensure_llm_state_layout(
