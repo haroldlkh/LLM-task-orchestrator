@@ -87,8 +87,7 @@ def _merge_results(base_results: pl.DataFrame, new_results: pl.DataFrame) -> pl.
         [ensure_result_df(base_results), ensure_result_df(new_results)],
         how="vertical_relaxed",
     )
-    combined = combined.sort(["unit_id"])
-    latest = combined.group_by("unit_id").tail(1)
+    latest = combined.unique(subset=["unit_id", "output_column"], keep="last")
     return ensure_result_df(latest)
 
 

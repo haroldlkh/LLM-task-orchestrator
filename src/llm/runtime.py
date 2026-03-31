@@ -64,6 +64,22 @@ def default_runtime(step_config: dict) -> dict:
             "all_transport_failure_cooldown_seconds", 0
         ),
 
+        # proactive TPM governor
+        "target_tokens_per_minute": runtime.get("target_tokens_per_minute", 0),
+        "token_estimation_chars_per_token": runtime.get(
+            "token_estimation_chars_per_token", 4.0
+        ),
+        "estimated_response_tokens_per_unit": runtime.get(
+            "estimated_response_tokens_per_unit", 14
+        ),
+        "estimated_request_overhead_tokens": runtime.get(
+            "estimated_request_overhead_tokens", 48
+        ),
+        "tpm_safety_margin": runtime.get("tpm_safety_margin", 0.85),
+        "max_sleep_to_respect_tpm_seconds": runtime.get(
+            "max_sleep_to_respect_tpm_seconds", 180
+        ),
+
         # release / artifacts
         "flush_scope": runtime.get("flush_scope", "unit"),
         "write_partial_merged_output": runtime.get("write_partial_merged_output", False),
@@ -193,6 +209,27 @@ def validate_llm_step(step_config: dict):
             "LLM runtime 'all_transport_failure_cooldown_seconds' must be >= 0"
         )
 
+    if runtime["target_tokens_per_minute"] < 0:
+        raise ValueError("LLM runtime 'target_tokens_per_minute' must be >= 0")
+    if runtime["token_estimation_chars_per_token"] <= 0:
+        raise ValueError(
+            "LLM runtime 'token_estimation_chars_per_token' must be > 0"
+        )
+    if runtime["estimated_response_tokens_per_unit"] < 0:
+        raise ValueError(
+            "LLM runtime 'estimated_response_tokens_per_unit' must be >= 0"
+        )
+    if runtime["estimated_request_overhead_tokens"] < 0:
+        raise ValueError(
+            "LLM runtime 'estimated_request_overhead_tokens' must be >= 0"
+        )
+    if runtime["tpm_safety_margin"] <= 0 or runtime["tpm_safety_margin"] > 1:
+        raise ValueError("LLM runtime 'tpm_safety_margin' must be > 0 and <= 1")
+    if runtime["max_sleep_to_respect_tpm_seconds"] < 0:
+        raise ValueError(
+            "LLM runtime 'max_sleep_to_respect_tpm_seconds' must be >= 0"
+        )
+
     if runtime["flush_scope"] not in {"unit", "row_complete"}:
         raise ValueError("LLM runtime 'flush_scope' must be 'unit' or 'row_complete'")
 
@@ -203,53 +240,43 @@ def validate_llm_step(step_config: dict):
 
 
 def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFrame:
-    """
-    Optional subset-windowing for testing on part of a full dataset without
-    changing the source file itself.
-    """
-    offset = runtime.get("input_row_offset", 0) or 0
-    limit = runtime.get("input_row_limit")
+    row_offset = runtime.get("input_row_offset", 0) or 0
+    row_limit = runtime.get("input_row_limit")
 
-    if limit is None:
-        if offset == 0:
-            return source_df
-        return source_df.slice(offset)
+    if row_offset > 0:
+        source_df = source_df.slice(row_offset)
 
-    return source_df.slice(offset, limit)
+    if row_limit is not None:
+        source_df = source_df.slice(0, row_limit)
+
+    return source_df
 
 
-def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
-    if progress_df.is_empty():
-        return set()
-
-    terminal = progress_df.filter(pl.col("status").is_in(["success", "permanent_error"]))
-    return set(terminal["unit_id"].to_list())
-
-
-def current_retry_count(progress_df: pl.DataFrame, unit_id: str) -> int:
-    if progress_df.is_empty():
-        return 0
-    rows = progress_df.filter(pl.col("unit_id") == unit_id)
-    if rows.is_empty():
-        return 0
-    return int(rows["retry_count"].to_list()[-1])
-
-
-def build_runtime_metadata(
-    step_config: dict,
-    work_units_df: pl.DataFrame,
-    progress_df: pl.DataFrame,
-    outcome: LLMRunOutcome,
+def build_run_metadata(
+    *,
+    step_name: str,
+    runtime: dict,
+    current_group_size: int,
+    pending_units: int,
+    outcome: LLMRunOutcome | None = None,
+    workflow_name: str | None = None,
+    current_concurrency: int | None = None,
+    current_load_budget: int | None = None,
 ) -> dict:
-    return {
-        "step_name": step_config["name"],
-        "model": step_config["model"],
-        "provider_config_key": step_config["provider_config_key"],
-        "prompt_version": step_config.get("kwargs", {}).get("prompt_version", "v1"),
-        "total_units": work_units_df.height,
-        "completed_or_terminal_units": len(success_or_terminal_unit_ids(progress_df)),
-        "processed_units_this_run": outcome.processed_units,
-        "remaining_units": outcome.remaining_units,
-        "outcome": outcome.status,
+    payload = {
+        "step_name": step_name,
+        "workflow_name": workflow_name,
+        "runtime": runtime,
+        "current_group_size": current_group_size,
+        "pending_units": pending_units,
         "updated_at": utc_now_iso(),
+        "current_concurrency": current_concurrency,
+        "current_load_budget": current_load_budget,
     }
+    if outcome is not None:
+        payload["outcome"] = {
+            "status": outcome.status,
+            "processed_units": outcome.processed_units,
+            "remaining_units": outcome.remaining_units,
+        }
+    return payload

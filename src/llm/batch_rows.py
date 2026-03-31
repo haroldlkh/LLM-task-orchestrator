@@ -201,20 +201,31 @@ def build_rows_from_group_parse(
         )
 
         if parsed["status"] == "success":
-            result_rows.append(
-                LLMResultRecord(
-                    unit_id=unit["unit_id"],
-                    row_id=unit["row_id"],
-                    output_column=unit["output_column"],
-                    status="success",
-                    parsed_output=_serialize_jsonish(parsed.get("parsed_output")),
-                    output_value=_serialize_output_value(parsed.get("output_value")),
-                    raw_output=_serialize_jsonish(request_result.get("raw_output")),
-                    error_type=parsed.get("error_type"),
-                    error_message=parsed.get("error_message"),
-                    review_flag=review_flag,
-                    review_reason=review_reason,
-                ).to_dict()
-            )
+            output_records = [(unit["output_column"], parsed.get("output_value"))]
+            extra_output_values = parsed.get("extra_output_values") or {}
+            if not isinstance(extra_output_values, dict):
+                raise ValueError(
+                    f"Expected extra_output_values to be a dict for unit {unit['unit_id']}"
+                )
+
+            for output_column, output_value in extra_output_values.items():
+                output_records.append((output_column, output_value))
+
+            for output_column, output_value in output_records:
+                result_rows.append(
+                    LLMResultRecord(
+                        unit_id=unit["unit_id"],
+                        row_id=unit["row_id"],
+                        output_column=output_column,
+                        status="success",
+                        parsed_output=_serialize_jsonish(parsed.get("parsed_output")),
+                        output_value=_serialize_output_value(output_value),
+                        raw_output=_serialize_jsonish(request_result.get("raw_output")),
+                        error_type=parsed.get("error_type"),
+                        error_message=parsed.get("error_message"),
+                        review_flag=review_flag,
+                        review_reason=review_reason,
+                    ).to_dict()
+                )
 
     return progress_rows, result_rows, debug_rows
