@@ -149,6 +149,32 @@ def request_score(useful_work: int, request_seconds: float) -> float:
     return useful_work / request_seconds
 
 
+def compute_wave_sleep_seconds(runtime: dict, wave_metrics: dict) -> tuple[float, str | None]:
+    transport_failures = int(wave_metrics.get("transport_failures", 0) or 0)
+    total_requests = int(wave_metrics.get("total_requests", 0) or 0)
+
+    if total_requests <= 0:
+        return 0.0, None
+
+    if transport_failures >= total_requests:
+        seconds = float(runtime.get("all_transport_failure_cooldown_seconds", 0) or 0)
+        if seconds > 0:
+            return seconds, "all_transport_failure_cooldown"
+        return 0.0, None
+
+    if transport_failures > 0:
+        seconds = float(runtime.get("transport_failure_cooldown_seconds", 0) or 0)
+        if seconds > 0:
+            return seconds, "transport_failure_cooldown"
+        return 0.0, None
+
+    seconds = float(runtime.get("min_inter_wave_sleep_seconds", 0) or 0)
+    if seconds > 0:
+        return seconds, "min_inter_wave_sleep"
+
+    return 0.0, None
+
+
 def choose_next_controller_state(
     controller: ControllerState,
     runtime: dict,

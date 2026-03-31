@@ -57,6 +57,17 @@ def default_runtime(step_config: dict) -> dict:
         "max_request_retries": runtime.get("max_request_retries", 3),
         "retry_backoff_seconds": runtime.get("retry_backoff_seconds", 10),
 
+        # request pacing / quota protection
+        "min_inter_wave_sleep_seconds": runtime.get("min_inter_wave_sleep_seconds", 0),
+        "transport_failure_cooldown_seconds": runtime.get(
+            "transport_failure_cooldown_seconds",
+            max(runtime.get("retry_backoff_seconds", 10) * 2, 10),
+        ),
+        "all_transport_failure_cooldown_seconds": runtime.get(
+            "all_transport_failure_cooldown_seconds",
+            max(runtime.get("retry_backoff_seconds", 10) * 4, 20),
+        ),
+
         # release / artifacts
         "flush_scope": runtime.get("flush_scope", "unit"),
         "write_partial_merged_output": runtime.get("write_partial_merged_output", False),
@@ -178,6 +189,24 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'max_request_retries' must be >= 0")
     if runtime["retry_backoff_seconds"] < 0:
         raise ValueError("LLM runtime 'retry_backoff_seconds' must be >= 0")
+    if runtime["min_inter_wave_sleep_seconds"] < 0:
+        raise ValueError("LLM runtime 'min_inter_wave_sleep_seconds' must be >= 0")
+    if runtime["transport_failure_cooldown_seconds"] < 0:
+        raise ValueError(
+            "LLM runtime 'transport_failure_cooldown_seconds' must be >= 0"
+        )
+    if runtime["all_transport_failure_cooldown_seconds"] < 0:
+        raise ValueError(
+            "LLM runtime 'all_transport_failure_cooldown_seconds' must be >= 0"
+        )
+    if (
+        runtime["all_transport_failure_cooldown_seconds"]
+        < runtime["transport_failure_cooldown_seconds"]
+    ):
+        raise ValueError(
+            "LLM runtime 'all_transport_failure_cooldown_seconds' must be >= "
+            "'transport_failure_cooldown_seconds'"
+        )
 
     if runtime["flush_scope"] not in {"unit", "row_complete"}:
         raise ValueError("LLM runtime 'flush_scope' must be 'unit' or 'row_complete'")

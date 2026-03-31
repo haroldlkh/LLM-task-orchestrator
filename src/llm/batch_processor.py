@@ -8,6 +8,7 @@ from .batch_rows import (
 from .batch_runtime import (
     ControllerState,
     choose_next_controller_state,
+    compute_wave_sleep_seconds,
     derive_group_size,
     log_progress,
     merge_progress_rows_in_memory,
@@ -94,6 +95,22 @@ def _execute_wave_requests(adapter, wave, step_config, runtime):
             time.sleep(retry_backoff_seconds * (attempt + 1))
 
     return adapter_results, last_exception, final_attempt_count
+
+
+def _sleep_between_waves(step_name: str, runtime: dict, wave_metrics: dict) -> None:
+    sleep_seconds, sleep_reason = compute_wave_sleep_seconds(runtime, wave_metrics)
+    if sleep_seconds <= 0:
+        return
+
+    print(
+        (
+            f"[llm:{step_name}] "
+            f"sleep_s={sleep_seconds:.2f} "
+            f"note={sleep_reason}"
+        ),
+        flush=True,
+    )
+    time.sleep(sleep_seconds)
 
 
 def process_batches(
@@ -259,6 +276,12 @@ def process_batches(
                 note=f"wave_request_exception {'|'.join(control_notes)}",
                 start_time=start_time,
             )
+
+            _sleep_between_waves(
+                step_name=step_config["name"],
+                runtime=runtime,
+                wave_metrics=wave_metrics,
+            )
         else:
             results_by_request_id = {row["request_id"]: row for row in adapter_results}
 
@@ -423,6 +446,12 @@ def process_batches(
                 progress_by_unit=progress_by_unit,
                 note="wave_complete " + "|".join(control_notes),
                 start_time=start_time,
+            )
+
+            _sleep_between_waves(
+                step_name=step_config["name"],
+                runtime=runtime,
+                wave_metrics=wave_metrics,
             )
 
         if should_flush(
