@@ -770,3 +770,22 @@ def process_llm_batches(
         "current_concurrency": controller.concurrency,
         "current_load_budget": int(controller.load_budget),
     }
+
+
+
+def process_batches(*, adapter, task_handler, prompt_context, pending_rows, progress_df, step_config, runtime, flush_callback, start_time=None):
+    progress_by_unit = {}
+    if progress_df is not None and not progress_df.is_empty():
+        for row in progress_df.to_dicts():
+            progress_by_unit[row["unit_id"]] = row
+    return process_llm_batches(
+        adapter=adapter,
+        task_handler=task_handler,
+        prompt_context=prompt_context,
+        pending_rows=pending_rows,
+        progress_df=progress_df,
+        progress_by_unit=progress_by_unit,
+        step_config=step_config,
+        runtime=runtime,
+        flush_callback=flush_callback,
+    )

@@ -58,7 +58,7 @@ def _iter_output_records(unit, parsed, request_result, review_flag, review_reaso
         ).to_dict()
         yielded_any = True
 
-        extra_outputs = parsed.get("extra_outputs") or {}
+        extra_outputs = parsed.get("extra_outputs") or parsed.get("extra_output_values") or {}
         for extra_output_column, extra_output_value in extra_outputs.items():
             yield LLMResultRecord(
                 unit_id=unit["unit_id"],
