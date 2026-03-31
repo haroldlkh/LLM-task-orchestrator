@@ -63,10 +63,11 @@ def log_progress(
     progress_by_unit: dict,
     note: str,
     start_time: float,
+    remaining_override: int | None = None,
 ) -> None:
     counts = status_counts_from_progress_map(progress_by_unit)
     elapsed = elapsed_seconds(start_time)
-    remaining = max(total_units - cursor, 0)
+    remaining = remaining_override if remaining_override is not None else max(total_units - cursor, 0)
 
     print(
         (
