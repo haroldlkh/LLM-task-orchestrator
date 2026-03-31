@@ -48,6 +48,9 @@ class LLMResultRecord:
     error_message: Optional[str] = None
     review_flag: bool = False
     review_reason: Optional[str] = None
+    key_alias: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -62,6 +65,9 @@ class LLMResultRecord:
             "error_message": self.error_message,
             "review_flag": self.review_flag,
             "review_reason": self.review_reason,
+            "key_alias": self.key_alias,
+            "provider": self.provider,
+            "model": self.model,
         }
 
 

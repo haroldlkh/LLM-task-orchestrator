@@ -258,7 +258,14 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
 
     provider_config = user_runtime_config[provider_config_key]
-    adapter = build_adapter(step_config["adapter"], provider_config)
+    adapter = build_adapter(step_config["adapter"], provider_config_key, provider_config)
+
+    if hasattr(adapter, "capacity_multiplier"):
+        lane_count = int(max(getattr(adapter, "capacity_multiplier"), 1))
+        if runtime.get("target_tokens_per_minute") is not None:
+            runtime["target_tokens_per_minute"] = float(runtime["target_tokens_per_minute"]) * float(lane_count)
+        runtime["max_concurrent_requests"] = max(int(runtime["max_concurrent_requests"]), lane_count)
+        runtime["initial_concurrency"] = max(int(runtime["initial_concurrency"]), min(lane_count, int(runtime["max_concurrent_requests"])))
     task_handler = build_task_handler(step_config["task_handler"])
     prompt_context = load_prompt_context(step_config)
     folders = ensure_llm_state_layout(

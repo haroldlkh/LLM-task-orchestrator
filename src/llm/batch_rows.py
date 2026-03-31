@@ -36,6 +36,9 @@ def _iter_result_records(unit, parsed, request_result, review_flag, review_reaso
         error_message=parsed.get("error_message"),
         review_flag=review_flag,
         review_reason=review_reason,
+        key_alias=request_result.get("key_alias"),
+        provider=request_result.get("provider"),
+        model=request_result.get("model"),
     ).to_dict()
 
     extra_outputs = parsed.get("extra_outputs") or parsed.get("extra_output_values") or {}
@@ -52,6 +55,9 @@ def _iter_result_records(unit, parsed, request_result, review_flag, review_reaso
             error_message=parsed.get("error_message"),
             review_flag=review_flag,
             review_reason=review_reason,
+            key_alias=request_result.get("key_alias"),
+            provider=request_result.get("provider"),
+            model=request_result.get("model"),
         ).to_dict()
 
 
@@ -97,6 +103,9 @@ def mark_group_transport_failure(group_units, request, request_result, progress_
                 "parsed_output": None,
                 "output_value": None,
                 "updated_at": now,
+                "key_alias": request_result.get("key_alias"),
+                "provider": request_result.get("provider"),
+                "model": request_result.get("model") or request.get("model"),
             }
         )
     return progress_rows, debug_rows
@@ -141,6 +150,9 @@ def mark_group_parse_failure(group_units, request, raw_output, error_type, error
                 "parsed_output": None,
                 "output_value": None,
                 "updated_at": now,
+                "key_alias": None,
+                "provider": None,
+                "model": request.get("model"),
             }
         )
     return progress_rows, debug_rows
@@ -199,6 +211,9 @@ def build_rows_from_group_parse(group_units, request, request_result, parse_resu
                 "parsed_output": _serialize_jsonish(parsed.get("parsed_output")),
                 "output_value": _serialize_output_value(parsed.get("output_value")),
                 "updated_at": now,
+                "key_alias": request_result.get("key_alias"),
+                "provider": request_result.get("provider"),
+                "model": request_result.get("model") or request.get("model"),
             }
         )
 

@@ -11,6 +11,9 @@ PROGRESS_SCHEMA: Dict[str, pl.DataType] = {
     "last_error_type": pl.Utf8,
     "last_error_message": pl.Utf8,
     "updated_at": pl.Utf8,
+    "key_alias": pl.Utf8,
+    "provider": pl.Utf8,
+    "model": pl.Utf8,
 }
 
 RESULT_SCHEMA: Dict[str, pl.DataType] = {
@@ -25,6 +28,9 @@ RESULT_SCHEMA: Dict[str, pl.DataType] = {
     "error_message": pl.Utf8,
     "review_flag": pl.Boolean,
     "review_reason": pl.Utf8,
+    "key_alias": pl.Utf8,
+    "provider": pl.Utf8,
+    "model": pl.Utf8,
 }
 
 DEBUG_SCHEMA: Dict[str, pl.DataType] = {
@@ -46,6 +52,9 @@ DEBUG_SCHEMA: Dict[str, pl.DataType] = {
     "parsed_output": pl.Utf8,
     "output_value": pl.Utf8,
     "updated_at": pl.Utf8,
+    "key_alias": pl.Utf8,
+    "provider": pl.Utf8,
+    "model": pl.Utf8,
 }
 
 
