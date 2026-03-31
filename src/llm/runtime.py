@@ -11,6 +11,7 @@ TPM_RUNTIME_DEFAULTS = {
     "estimated_request_overhead_tokens": 250,
     "tpm_safety_margin": 0.80,
     "max_sleep_to_respect_tpm_seconds": 120,
+    "max_request_wall_time_seconds": 300,
 }
 
 
@@ -64,19 +65,6 @@ def default_runtime(step_config: dict) -> dict:
         "write_pair_status": bool(runtime.get("write_pair_status", False)),
         "input_row_limit": runtime.get("input_row_limit"),
         "input_row_offset": int(runtime.get("input_row_offset", 0)),
-        "lane_strategy": runtime.get("lane_strategy", "hybrid"),
-        "initial_active_lanes": int(runtime.get("initial_active_lanes", 1)),
-        "max_active_lanes": int(runtime.get("max_active_lanes", 999999)),
-        "lane_exploration_success_waves": int(runtime.get("lane_exploration_success_waves", 2)),
-        "lane_reduction_cooldown_waves": int(runtime.get("lane_reduction_cooldown_waves", 2)),
-        "shared_failure_window_seconds": float(runtime.get("shared_failure_window_seconds", 90)),
-        "shared_failure_lane_threshold": int(runtime.get("shared_failure_lane_threshold", 2)),
-        "allow_spillover_when_tpm_blocked": bool(runtime.get("allow_spillover_when_tpm_blocked", True)),
-        "artifact_retention_mode": runtime.get("artifact_retention_mode", "standard"),
-        "keep_last_flushes": int(runtime.get("keep_last_flushes", 3)),
-        "keep_last_final_outputs": int(runtime.get("keep_last_final_outputs", 3)),
-        "keep_last_runs": int(runtime.get("keep_last_runs", 10)),
-        "keep_all_flushes_within_kept_runs": bool(runtime.get("keep_all_flushes_within_kept_runs", True)),
     }
     merged.update({key: runtime.get(key, default) for key, default in TPM_RUNTIME_DEFAULTS.items()})
     return merged
@@ -186,32 +174,6 @@ def validate_llm_step(step_config: dict):
     if runtime["flush_scope"] not in {"unit", "row_complete"}:
         raise ValueError("LLM runtime 'flush_scope' must be one of {'unit', 'row_complete'}")
 
-
-    if runtime["lane_strategy"] not in {"hybrid", "safe_single_active"}:
-        raise ValueError("LLM runtime 'lane_strategy' must be one of {'hybrid', 'safe_single_active'}")
-    if runtime["initial_active_lanes"] < 1:
-        raise ValueError("LLM runtime 'initial_active_lanes' must be >= 1")
-    if runtime["max_active_lanes"] < 1:
-        raise ValueError("LLM runtime 'max_active_lanes' must be >= 1")
-    if runtime["initial_active_lanes"] > runtime["max_active_lanes"]:
-        raise ValueError("LLM runtime 'initial_active_lanes' must be <= 'max_active_lanes'")
-    if runtime["lane_exploration_success_waves"] < 1:
-        raise ValueError("LLM runtime 'lane_exploration_success_waves' must be >= 1")
-    if runtime["lane_reduction_cooldown_waves"] < 1:
-        raise ValueError("LLM runtime 'lane_reduction_cooldown_waves' must be >= 1")
-    if runtime["shared_failure_window_seconds"] < 0:
-        raise ValueError("LLM runtime 'shared_failure_window_seconds' must be >= 0")
-    if runtime["shared_failure_lane_threshold"] < 1:
-        raise ValueError("LLM runtime 'shared_failure_lane_threshold' must be >= 1")
-    if runtime["artifact_retention_mode"] not in {"standard", "debug"}:
-        raise ValueError("LLM runtime 'artifact_retention_mode' must be one of {'standard', 'debug'}")
-    if runtime["keep_last_flushes"] < 1:
-        raise ValueError("LLM runtime 'keep_last_flushes' must be >= 1")
-    if runtime["keep_last_final_outputs"] < 1:
-        raise ValueError("LLM runtime 'keep_last_final_outputs' must be >= 1")
-    if runtime["keep_last_runs"] < 1:
-        raise ValueError("LLM runtime 'keep_last_runs' must be >= 1")
-
     if runtime["target_tokens_per_minute"] is not None:
         if float(runtime["target_tokens_per_minute"]) <= 0:
             raise ValueError("LLM runtime 'target_tokens_per_minute' must be > 0 when provided")
@@ -225,6 +187,9 @@ def validate_llm_step(step_config: dict):
             raise ValueError("LLM runtime 'tpm_safety_margin' must be > 0 and <= 1")
         if float(runtime["max_sleep_to_respect_tpm_seconds"]) < 0:
             raise ValueError("LLM runtime 'max_sleep_to_respect_tpm_seconds' must be >= 0")
+    if runtime["max_request_wall_time_seconds"] is not None:
+        if float(runtime["max_request_wall_time_seconds"]) <= 0:
+            raise ValueError("LLM runtime 'max_request_wall_time_seconds' must be > 0 when provided")
 
 
 def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFrame:
