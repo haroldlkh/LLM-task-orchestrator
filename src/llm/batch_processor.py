@@ -1,3 +1,4 @@
+import math
 import time
 
 from .batch_rows import (
@@ -19,6 +20,120 @@ from .validators import (
     validate_grouped_adapter_batch_results,
     validate_grouped_parse_results,
 )
+
+
+def _estimate_request_tokens(request: dict, group_units, runtime: dict) -> int:
+    chars_per_token = float(runtime.get("token_estimation_chars_per_token", 4.0) or 4.0)
+    response_tokens_per_unit = float(runtime.get("estimated_response_tokens_per_unit", 24) or 24)
+    overhead_tokens = float(runtime.get("estimated_request_overhead_tokens", 250) or 250)
+
+    prompt_text = request.get("prompt", "") or ""
+    prompt_tokens = math.ceil(len(prompt_text) / max(chars_per_token, 0.1))
+    response_tokens = math.ceil(len(group_units) * response_tokens_per_unit)
+    total = int(prompt_tokens + response_tokens + overhead_tokens)
+    return max(total, 1)
+
+
+def _prune_token_window(token_window: list[dict], now: float) -> list[dict]:
+    cutoff = now - 60.0
+    return [entry for entry in token_window if entry["sent_at"] > cutoff]
+
+
+def _rolling_window_tokens(token_window: list[dict], now: float) -> int:
+    token_window[:] = _prune_token_window(token_window, now)
+    return int(sum(entry["tokens"] for entry in token_window))
+
+
+def _wait_for_tpm_budget(step_name: str, runtime: dict, token_window: list[dict], next_wave_tokens: int) -> None:
+    target_tpm = runtime.get("target_tokens_per_minute")
+    if target_tpm is None:
+        return
+
+    safe_budget = float(target_tpm) * float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
+    max_sleep = float(runtime.get("max_sleep_to_respect_tpm_seconds", 120) or 120)
+
+    while True:
+        now = time.time()
+        rolling_tokens = _rolling_window_tokens(token_window, now)
+        if rolling_tokens + next_wave_tokens <= safe_budget:
+            print(
+                f"[llm:{step_name}] tpm_window rolling_tokens={rolling_tokens} next_wave_tokens={next_wave_tokens} safe_budget={int(safe_budget)} note=within_budget",
+                flush=True,
+            )
+            return
+
+        if not token_window:
+            return
+
+        oldest_expiry = min(entry["sent_at"] + 60.0 for entry in token_window)
+        sleep_seconds = max(0.0, oldest_expiry - now)
+        if sleep_seconds <= 0:
+            token_window[:] = _prune_token_window(token_window, time.time())
+            continue
+
+        sleep_seconds = min(sleep_seconds, max_sleep)
+        print(
+            f"[llm:{step_name}] tpm_window rolling_tokens={rolling_tokens} next_wave_tokens={next_wave_tokens} safe_budget={int(safe_budget)} sleep_s={sleep_seconds:.2f} reason=tpm_budget_wait",
+            flush=True,
+        )
+        time.sleep(sleep_seconds)
+
+
+def _fit_wave_to_tpm_budget(
+    pending_rows,
+    cursor,
+    desired_group_size,
+    concurrency,
+    step_config,
+    task_handler,
+    prompt_context,
+    runtime,
+):
+    target_tpm = runtime.get("target_tokens_per_minute")
+    min_group_size = int(runtime["min_group_size"])
+    current_group_size = int(desired_group_size)
+
+    while True:
+        wave, _ = _build_wave_requests(
+            pending_rows=pending_rows,
+            cursor=cursor,
+            group_size=current_group_size,
+            concurrency=concurrency,
+            step_config=step_config,
+            task_handler=task_handler,
+            prompt_context=prompt_context,
+        )
+        if not wave:
+            return wave, current_group_size, []
+
+        request_token_estimates = [
+            _estimate_request_tokens(item["request"], item["group_units"], runtime)
+            for item in wave
+        ]
+        next_wave_tokens = int(sum(request_token_estimates))
+
+        if target_tpm is None:
+            return wave, current_group_size, request_token_estimates
+
+        safe_budget = float(target_tpm) * float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
+        if next_wave_tokens <= safe_budget or current_group_size <= min_group_size:
+            if next_wave_tokens > safe_budget and current_group_size <= min_group_size:
+                print(
+                    f"[llm:{step_config['name']}] tpm_fit_group_size group_size={current_group_size} estimated_tokens={next_wave_tokens} safe_budget={int(safe_budget)} note=min_group_size_floor",
+                    flush=True,
+                )
+            return wave, current_group_size, request_token_estimates
+
+        next_group_size = max(min_group_size, int(math.floor(current_group_size * 0.85)))
+        if next_group_size >= current_group_size:
+            next_group_size = current_group_size - 1
+        next_group_size = max(next_group_size, min_group_size)
+
+        print(
+            f"[llm:{step_config['name']}] tpm_fit_group_size group_size={current_group_size} next_group_size={next_group_size} estimated_tokens={next_wave_tokens} safe_budget={int(safe_budget)} note=shrink_wave_to_fit_tpm",
+            flush=True,
+        )
+        current_group_size = next_group_size
 
 
 def _build_wave_requests(
@@ -134,7 +249,6 @@ def process_batches(
     pending_rows = [] if pending_rows is None else list(pending_rows)
 
     soft_time_limit_seconds = runtime["soft_time_limit_minutes"] * 60
-
     total_units = len(pending_rows)
     processed_count = 0
 
@@ -149,6 +263,7 @@ def process_batches(
     units_since_flush = 0
     completed_flushes = 0
     last_flush_time = time.time()
+    token_window = []
 
     controller = ControllerState(
         load_budget=float(runtime["initial_load_budget"]),
@@ -180,26 +295,36 @@ def process_batches(
             )
             break
 
-        group_size = derive_group_size(
+        desired_group_size = derive_group_size(
             controller.load_budget,
             controller.concurrency,
             runtime["min_group_size"],
             runtime["max_group_size"],
         )
 
-        wave, reserved_cursor = _build_wave_requests(
+        wave, group_size, request_token_estimates = _fit_wave_to_tpm_budget(
             pending_rows=pending_rows,
             cursor=cursor,
-            group_size=group_size,
+            desired_group_size=desired_group_size,
             concurrency=controller.concurrency,
             step_config=step_config,
             task_handler=task_handler,
             prompt_context=prompt_context,
+            runtime=runtime,
         )
         if not wave:
             break
 
+        next_wave_tokens = int(sum(request_token_estimates))
+        _wait_for_tpm_budget(
+            step_name=step_config["name"],
+            runtime=runtime,
+            token_window=token_window,
+            next_wave_tokens=next_wave_tokens,
+        )
+
         wave_index += 1
+        rolling_before_send = _rolling_window_tokens(token_window, time.time())
         log_progress(
             step_name=step_config["name"],
             wave_index=wave_index,
@@ -211,9 +336,13 @@ def process_batches(
             current_load_budget=controller.load_budget,
             success_streak=controller.good_wave_streak,
             progress_by_unit=progress_by_unit,
-            note=f"wave_start groups={len(wave)} size={group_size}",
+            note=f"wave_start groups={len(wave)} size={group_size} estimated_next_wave_tokens={next_wave_tokens} rolling_tokens={rolling_before_send}",
             start_time=start_time,
         )
+
+        send_time = time.time()
+        for est in request_token_estimates:
+            token_window.append({"sent_at": send_time, "tokens": int(est)})
 
         wave_start = time.time()
         adapter_results, last_exception, wave_attempt_count = _execute_wave_requests(
@@ -486,10 +615,7 @@ def process_batches(
 
             if flush_payload and flush_payload.get("counted_flush"):
                 completed_flushes += 1
-                if (
-                    runtime.get("max_flushes_per_run") is not None
-                    and completed_flushes >= runtime["max_flushes_per_run"]
-                ):
+                if runtime.get("max_flushes_per_run") is not None and completed_flushes >= runtime["max_flushes_per_run"]:
                     log_progress(
                         step_name=step_config["name"],
                         wave_index=wave_index,
@@ -564,12 +690,4 @@ def process_batches(
 
     return {
         "outcome": outcome,
-        "current_group_size": derive_group_size(
-            controller.load_budget,
-            controller.concurrency,
-            runtime["min_group_size"],
-            runtime["max_group_size"],
-        ),
-        "current_concurrency": controller.concurrency,
-        "current_load_budget": int(controller.load_budget),
     }

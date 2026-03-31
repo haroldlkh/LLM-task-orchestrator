@@ -46,12 +46,8 @@ def default_runtime(step_config: dict) -> dict:
         "load_growth_factor": float(runtime.get("load_growth_factor", 1.35)),
         "load_shrink_factor": float(runtime.get("load_shrink_factor", 0.60)),
         "mild_load_shrink_factor": float(runtime.get("mild_load_shrink_factor", 0.85)),
-        "concurrency_growth_cooldown_waves": int(
-            runtime.get("concurrency_growth_cooldown_waves", 2)
-        ),
-        "concurrency_shrink_cooldown_waves": int(
-            runtime.get("concurrency_shrink_cooldown_waves", 1)
-        ),
+        "concurrency_growth_cooldown_waves": int(runtime.get("concurrency_growth_cooldown_waves", 2)),
+        "concurrency_shrink_cooldown_waves": int(runtime.get("concurrency_shrink_cooldown_waves", 1)),
         "flush_every_n_units": int(runtime.get("flush_every_n_units", 50)),
         "flush_every_n_groups": int(runtime.get("flush_every_n_groups", 1)),
         "flush_every_n_seconds": int(runtime.get("flush_every_n_seconds", 60)),
@@ -61,24 +57,15 @@ def default_runtime(step_config: dict) -> dict:
         "max_request_retries": int(runtime.get("max_request_retries", 3)),
         "retry_backoff_seconds": float(runtime.get("retry_backoff_seconds", 10)),
         "min_inter_wave_sleep_seconds": float(runtime.get("min_inter_wave_sleep_seconds", 0)),
-        "transport_failure_cooldown_seconds": float(
-            runtime.get("transport_failure_cooldown_seconds", 0)
-        ),
-        "all_transport_failure_cooldown_seconds": float(
-            runtime.get("all_transport_failure_cooldown_seconds", 0)
-        ),
+        "transport_failure_cooldown_seconds": float(runtime.get("transport_failure_cooldown_seconds", 0)),
+        "all_transport_failure_cooldown_seconds": float(runtime.get("all_transport_failure_cooldown_seconds", 0)),
         "flush_scope": runtime.get("flush_scope", "unit"),
-        "write_partial_merged_output": bool(
-            runtime.get("write_partial_merged_output", False)
-        ),
+        "write_partial_merged_output": bool(runtime.get("write_partial_merged_output", False)),
         "write_pair_status": bool(runtime.get("write_pair_status", False)),
         "input_row_limit": runtime.get("input_row_limit"),
         "input_row_offset": int(runtime.get("input_row_offset", 0)),
     }
-    merged.update({
-        key: runtime.get(key, default)
-        for key, default in TPM_RUNTIME_DEFAULTS.items()
-    })
+    merged.update({key: runtime.get(key, default) for key, default in TPM_RUNTIME_DEFAULTS.items()})
     return merged
 
 
@@ -184,11 +171,7 @@ def validate_llm_step(step_config: dict):
     if runtime["all_transport_failure_cooldown_seconds"] < 0:
         raise ValueError("LLM runtime 'all_transport_failure_cooldown_seconds' must be >= 0")
     if runtime["flush_scope"] not in {"unit", "row_complete"}:
-        raise ValueError("LLM runtime 'flush_scope' must be 'unit' or 'row_complete'")
-    if runtime["input_row_limit"] is not None and int(runtime["input_row_limit"]) < 1:
-        raise ValueError("LLM runtime 'input_row_limit' must be >= 1 when provided")
-    if runtime["input_row_offset"] < 0:
-        raise ValueError("LLM runtime 'input_row_offset' must be >= 0")
+        raise ValueError("LLM runtime 'flush_scope' must be one of {'unit', 'row_complete'}")
 
     if runtime["target_tokens_per_minute"] is not None:
         if float(runtime["target_tokens_per_minute"]) <= 0:
@@ -208,6 +191,10 @@ def validate_llm_step(step_config: dict):
 def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFrame:
     offset = int(runtime.get("input_row_offset", 0) or 0)
     limit = runtime.get("input_row_limit")
+    if offset < 0:
+        raise ValueError("LLM runtime 'input_row_offset' must be >= 0")
+    if limit is not None and int(limit) < 0:
+        raise ValueError("LLM runtime 'input_row_limit' must be >= 0 when provided")
     if offset:
         source_df = source_df.slice(offset)
     if limit is not None:
@@ -218,9 +205,7 @@ def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFra
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
     if progress_df is None or progress_df.is_empty():
         return set()
-    terminal = progress_df.filter(
-        pl.col("status").is_in(["success", "permanent_error"])
-    )
+    terminal = progress_df.filter(pl.col("status").is_in(["success", "permanent_error"]))
     return set(terminal["unit_id"].to_list())
 
 

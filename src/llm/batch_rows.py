@@ -203,8 +203,6 @@ def build_rows_from_group_parse(group_units, request, request_result, parse_resu
         )
 
         if parsed["status"] == "success":
-            result_rows.extend(
-                list(_iter_result_records(unit, parsed, request_result, review_flag, review_reason))
-            )
+            result_rows.extend(list(_iter_result_records(unit, parsed, request_result, review_flag, review_reason)))
 
     return progress_rows, result_rows, debug_rows
