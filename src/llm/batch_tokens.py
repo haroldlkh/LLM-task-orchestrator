@@ -23,11 +23,48 @@ def rolling_window_tokens(token_window: list[dict], now: float) -> int:
     return int(sum(entry["tokens"] for entry in token_window))
 
 
-def lane_safe_budget(runtime: dict) -> float | None:
+def configured_lane_target_tpm(runtime: dict) -> float | None:
     target_tpm = runtime.get("target_tokens_per_minute")
     if target_tpm is None:
         return None
-    return float(target_tpm) * float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
+    return float(target_tpm)
+
+
+def lane_safe_budget(runtime: dict) -> float | None:
+    target_tpm = configured_lane_target_tpm(runtime)
+    if target_tpm is None:
+        return None
+    return target_tpm * float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
+
+
+def pool_safe_budget(runtime: dict) -> float | None:
+    per_lane_safe = lane_safe_budget(runtime)
+    if per_lane_safe is None:
+        return None
+    lane_count = max(1, int(runtime.get("available_lane_count", 1) or 1))
+    return per_lane_safe * lane_count
+
+
+def tpm_budget_snapshot(runtime: dict) -> dict:
+    per_key_target_tpm = configured_lane_target_tpm(runtime)
+    if per_key_target_tpm is None:
+        return {
+            "enabled": False,
+            "lane_count": max(1, int(runtime.get("available_lane_count", 1) or 1)),
+        }
+    safety_margin = float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
+    per_key_safe_budget = lane_safe_budget(runtime)
+    pool_safe = pool_safe_budget(runtime)
+    lane_count = max(1, int(runtime.get("available_lane_count", 1) or 1))
+    return {
+        "enabled": True,
+        "lane_count": lane_count,
+        "safety_margin": safety_margin,
+        "per_key_target_tpm": per_key_target_tpm,
+        "per_key_safe_budget": per_key_safe_budget,
+        "pool_target_tpm": per_key_target_tpm * lane_count,
+        "pool_safe_budget": pool_safe,
+    }
 
 
 def lane_wait_seconds_for_tpm(runtime: dict, token_window: list[dict], next_wave_tokens: int, now: float) -> float:
@@ -47,12 +84,18 @@ def lane_wait_seconds_for_tpm(runtime: dict, token_window: list[dict], next_wave
 
 
 def describe_tpm_state(runtime: dict, token_window: list[dict], next_wave_tokens: int, now: float) -> str:
-    safe_budget = lane_safe_budget(runtime)
-    if safe_budget is None:
+    budget = tpm_budget_snapshot(runtime)
+    if not budget.get("enabled"):
         return "tpm=disabled"
     rolling_tokens = rolling_window_tokens(token_window, now)
     wait_seconds = lane_wait_seconds_for_tpm(runtime, token_window, next_wave_tokens, now)
     return (
-        f"tpm=safe_budget:{int(safe_budget)} rolling:{rolling_tokens} "
-        f"next_wave:{int(next_wave_tokens)} wait_s:{wait_seconds:.2f}"
+        f"tpm=per_key_safe_budget:{int(budget['per_key_safe_budget'])} "
+        f"pool_safe_budget:{int(budget['pool_safe_budget'])} "
+        f"per_key_target_tpm:{int(budget['per_key_target_tpm'])} "
+        f"pool_target_tpm:{int(budget['pool_target_tpm'])} "
+        f"lane_count:{budget['lane_count']} "
+        f"lane_rolling:{rolling_tokens} "
+        f"next_wave:{int(next_wave_tokens)} "
+        f"wait_s:{wait_seconds:.2f}"
     )

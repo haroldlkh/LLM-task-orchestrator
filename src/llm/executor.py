@@ -277,12 +277,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     adapter = build_adapter(step_config["adapter"], provider_config)
 
     pool_size = int(getattr(adapter, "lane_count", getattr(adapter, "pool_size", 1)) or 1)
-    if pool_size > 1:
-        runtime["initial_concurrency"] = max(runtime["initial_concurrency"], min(pool_size, runtime["max_concurrent_requests"]))
-        runtime["max_concurrent_requests"] = max(runtime["max_concurrent_requests"], pool_size)
-        runtime["initial_load_budget"] = max(runtime["initial_load_budget"], runtime["initial_group_size"] * runtime["initial_concurrency"])
-        if runtime.get("target_tokens_per_minute") is not None:
-            runtime["target_tokens_per_minute"] = float(runtime["target_tokens_per_minute"]) * pool_size
+    runtime["available_lane_count"] = pool_size
 
     task_handler = build_task_handler(step_config["task_handler"])
     prompt_context = load_prompt_context(step_config)
@@ -305,7 +300,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             f"pending_units={pending_units_df.height} initial_group_size={runtime['initial_group_size']} "
             f"min_group_size={runtime['min_group_size']} max_group_size={runtime['max_group_size']} "
             f"flush_scope={runtime['flush_scope']} max_flushes_per_run={runtime['max_flushes_per_run']} "
-            f"max_concurrent_requests={runtime['max_concurrent_requests']} workflow_folder={pipeline_name}"
+            f"max_concurrent_requests={runtime['max_concurrent_requests']} available_lanes={runtime.get('available_lane_count', 1)} workflow_folder={pipeline_name}"
         ),
         flush=True,
     )

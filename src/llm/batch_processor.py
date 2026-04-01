@@ -19,8 +19,10 @@ from .batch_runtime import (
 from .batch_tokens import (
     describe_tpm_state,
     estimate_request_tokens,
+    lane_safe_budget,
     lane_wait_seconds_for_tpm,
     rolling_window_tokens,
+    tpm_budget_snapshot,
 )
 from .models import LLMRunOutcome
 from .request_timeout import effective_request_timeout_seconds, timeout_window_summary
@@ -121,7 +123,7 @@ def _fit_group_to_tpm_budget(
         if not group_units:
             return None
         estimated_tokens = estimate_request_tokens(request, group_units, runtime)
-        safe_budget = runtime.get("target_tokens_per_minute")
+        safe_budget = lane_safe_budget(runtime)
         if safe_budget is None:
             return {
                 "group_units": group_units,
@@ -131,12 +133,11 @@ def _fit_group_to_tpm_budget(
                 "resize_note": resize_note,
             }
 
-        effective_safe_budget = float(runtime["target_tokens_per_minute"]) * float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
-        if estimated_tokens <= effective_safe_budget or group_size == runtime["min_group_size"]:
+        if estimated_tokens <= safe_budget or group_size == runtime["min_group_size"]:
             if group_size != requested_group_size:
                 resize_note = (
                     f"group_resized_for_tpm from={requested_group_size} to={group_size} "
-                    f"estimated_tokens={estimated_tokens} safe_budget={int(effective_safe_budget)}"
+                    f"estimated_tokens={estimated_tokens} per_key_safe_budget={int(safe_budget)}"
                 )
             return {
                 "group_units": group_units,
@@ -399,6 +400,19 @@ def process_batches(
     max_active_lanes = max(1, min(len(lanes), int(runtime.get("max_active_lanes", len(lanes) or 1))))
     shared_failure_events = deque()
     last_lane_limit_reduction_wave = 0
+
+    tpm_budget = tpm_budget_snapshot(runtime)
+    if tpm_budget.get("enabled"):
+        print(
+            (
+                f"[llm:{step_config['name']}] tpm_budget per_key_target_tpm={int(tpm_budget['per_key_target_tpm'])} "
+                f"per_key_safe_budget={int(tpm_budget['per_key_safe_budget'])} "
+                f"pool_target_tpm={int(tpm_budget['pool_target_tpm'])} "
+                f"pool_safe_budget={int(tpm_budget['pool_safe_budget'])} "
+                f"available_lanes={tpm_budget['lane_count']} active_lane_limit={current_active_lane_limit}"
+            ),
+            flush=True,
+        )
 
     with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as executor:
         while pending_queue or active:
