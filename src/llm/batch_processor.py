@@ -1,3 +1,4 @@
+import math
 import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -16,20 +17,86 @@ from .batch_runtime import (
     request_score,
     should_flush,
 )
-from .batch_tokens import (
-    describe_tpm_state,
-    estimate_request_tokens,
-    lane_safe_budget,
-    lane_wait_seconds_for_tpm,
-    rolling_window_tokens,
-    tpm_budget_snapshot,
-)
 from .models import LLMRunOutcome
-from .request_timeout import timeout_window_summary
 from .validators import validate_grouped_parse_results
 
 
 TERMINAL_STATUSES = {"success", "permanent_error"}
+
+
+def _estimate_request_tokens(request: dict, group_units, runtime: dict) -> int:
+    chars_per_token = float(runtime.get("token_estimation_chars_per_token", 4.0) or 4.0)
+    response_tokens_per_unit = float(runtime.get("estimated_response_tokens_per_unit", 24) or 24)
+    overhead_tokens = float(runtime.get("estimated_request_overhead_tokens", 250) or 250)
+
+    prompt_text = request.get("prompt", "") or ""
+    prompt_tokens = math.ceil(len(prompt_text) / max(chars_per_token, 0.1))
+    response_tokens = math.ceil(len(group_units) * response_tokens_per_unit)
+    total = int(prompt_tokens + response_tokens + overhead_tokens)
+    return max(total, 1)
+
+
+def _prune_token_window(token_window: list[dict], now: float) -> list[dict]:
+    cutoff = now - 60.0
+    return [entry for entry in token_window if entry["sent_at"] > cutoff]
+
+
+def _rolling_window_tokens(token_window: list[dict], now: float) -> int:
+    token_window[:] = _prune_token_window(token_window, now)
+    return int(sum(entry["tokens"] for entry in token_window))
+
+
+def _available_lane_count(runtime: dict, lanes) -> int:
+    configured = runtime.get("available_lane_count")
+    if configured is not None:
+        return max(int(configured), 1)
+    if lanes is not None:
+        return max(len(lanes), 1)
+    return 1
+
+
+def _per_key_target_tpm(runtime: dict) -> float | None:
+    target_tpm = runtime.get("target_tokens_per_minute")
+    if target_tpm is None:
+        return None
+    return float(target_tpm)
+
+
+def _pool_target_tpm(runtime: dict, lanes=None) -> float | None:
+    per_key = _per_key_target_tpm(runtime)
+    if per_key is None:
+        return None
+    return per_key * _available_lane_count(runtime, lanes)
+
+
+def _lane_safe_budget(runtime: dict) -> float | None:
+    per_key = _per_key_target_tpm(runtime)
+    if per_key is None:
+        return None
+    return per_key * float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
+
+
+def _pool_safe_budget(runtime: dict, lanes=None) -> float | None:
+    pool_target = _pool_target_tpm(runtime, lanes)
+    if pool_target is None:
+        return None
+    return pool_target * float(runtime.get("tpm_safety_margin", 0.80) or 0.80)
+
+
+def _lane_wait_seconds_for_tpm(runtime: dict, token_window: list[dict], next_wave_tokens: int, now: float) -> float:
+    safe_budget = _lane_safe_budget(runtime)
+    if safe_budget is None:
+        return 0.0
+
+    rolling_tokens = _rolling_window_tokens(token_window, now)
+    if rolling_tokens + next_wave_tokens <= safe_budget:
+        return 0.0
+    if not token_window:
+        return 0.0
+
+    oldest_expiry = min(entry["sent_at"] + 60.0 for entry in token_window)
+    sleep_seconds = max(0.0, oldest_expiry - now)
+    return min(sleep_seconds, float(runtime.get("max_sleep_to_respect_tpm_seconds", 120) or 120))
 
 
 def _build_group_request(queue_snapshot, group_size, step_config, task_handler, prompt_context):
@@ -81,13 +148,22 @@ def _lane_health_key(lane: dict) -> tuple:
     return (lane["health_score"], -lane["waves_started"], -lane["cooldown_until"])
 
 
-def _lane_current_group_size(lane: dict, runtime: dict) -> int:
-    return derive_group_size(
+def _lane_next_available_delay(lane: dict, runtime: dict, queue_snapshot, step_config, task_handler, prompt_context, now: float):
+    if lane["in_flight"]:
+        return None
+    group_size = derive_group_size(
         lane["controller"].load_budget,
         lane["controller"].concurrency,
         runtime["min_group_size"],
         runtime["max_group_size"],
     )
+    group_units, request = _build_group_request(queue_snapshot, group_size, step_config, task_handler, prompt_context)
+    if not group_units:
+        return None
+    estimated_tokens = _estimate_request_tokens(request, group_units, runtime)
+    delay = max(0.0, lane["cooldown_until"] - now)
+    delay = max(delay, _lane_wait_seconds_for_tpm(runtime, lane["token_window"], estimated_tokens, now))
+    return delay
 
 
 def _safe_primary_candidate(lanes, primary_key_alias):
@@ -106,75 +182,28 @@ def _count_recent_shared_failures(shared_failure_events: deque, runtime: dict, n
     return len({lane_alias for _, lane_alias in shared_failure_events})
 
 
-def _fit_group_to_tpm_budget(
-    lane,
-    runtime,
-    queue_snapshot,
-    step_config,
-    task_handler,
-    prompt_context,
-):
-    requested_group_size = _lane_current_group_size(lane, runtime)
-    group_size = requested_group_size
-    resize_note = None
-
-    while group_size >= runtime["min_group_size"]:
-        group_units, request = _build_group_request(queue_snapshot, group_size, step_config, task_handler, prompt_context)
-        if not group_units:
-            return None
-        estimated_tokens = estimate_request_tokens(request, group_units, runtime)
-        safe_budget = lane_safe_budget(runtime)
-        if safe_budget is None:
-            return {
-                "group_units": group_units,
-                "request": request,
-                "estimated_tokens": estimated_tokens,
-                "requested_group_size": requested_group_size,
-                "resize_note": resize_note,
-            }
-
-        if estimated_tokens <= safe_budget or group_size == runtime["min_group_size"]:
-            if group_size != requested_group_size:
-                resize_note = (
-                    f"group_resized_for_tpm from={requested_group_size} to={group_size} "
-                    f"estimated_tokens={estimated_tokens} per_key_safe_budget={int(safe_budget)}"
-                )
-            return {
-                "group_units": group_units,
-                "request": request,
-                "estimated_tokens": estimated_tokens,
-                "requested_group_size": requested_group_size,
-                "resize_note": resize_note,
-            }
-
-        group_size -= 1
-
-    return None
-
-
 def _eligible_candidate_for_lane(lane, runtime, queue_snapshot, step_config, task_handler, prompt_context, now: float):
     if lane["in_flight"]:
         return None
-
-    fit = _fit_group_to_tpm_budget(
-        lane=lane,
-        runtime=runtime,
-        queue_snapshot=queue_snapshot,
-        step_config=step_config,
-        task_handler=task_handler,
-        prompt_context=prompt_context,
+    group_size = derive_group_size(
+        lane["controller"].load_budget,
+        lane["controller"].concurrency,
+        runtime["min_group_size"],
+        runtime["max_group_size"],
     )
-    if fit is None:
+    group_units, request = _build_group_request(queue_snapshot, group_size, step_config, task_handler, prompt_context)
+    if not group_units:
         return None
-
-    tpm_delay = lane_wait_seconds_for_tpm(runtime, lane["token_window"], fit["estimated_tokens"], now)
+    estimated_tokens = _estimate_request_tokens(request, group_units, runtime)
+    tpm_delay = _lane_wait_seconds_for_tpm(runtime, lane["token_window"], estimated_tokens, now)
     cooldown_delay = max(0.0, lane["cooldown_until"] - now)
     return {
         "lane": lane,
-        **fit,
+        "group_units": group_units,
+        "request": request,
+        "estimated_tokens": estimated_tokens,
         "tpm_delay": tpm_delay,
         "cooldown_delay": cooldown_delay,
-        "tpm_state": describe_tpm_state(runtime, lane["token_window"], fit["estimated_tokens"], now),
     }
 
 
@@ -193,7 +222,7 @@ def _select_dispatch_lane(
     strategy = runtime.get("lane_strategy", "hybrid")
 
     if sum(1 for lane in lanes if lane["in_flight"]) >= active_lane_limit:
-        return None, []
+        return None
 
     candidates = []
     blocked_candidates = []
@@ -211,22 +240,22 @@ def _select_dispatch_lane(
         if primary_lane is not None:
             primary_candidates = [item for item in candidates if item["lane"]["key_alias"] == primary_lane["key_alias"]]
             if primary_candidates:
-                return primary_candidates[0], blocked_candidates
+                return primary_candidates[0]
             if not runtime.get("allow_spillover_when_tpm_blocked", True):
-                return None, blocked_candidates
+                return None
             primary_blocked = [item for item in blocked_candidates if item["lane"]["key_alias"] == primary_lane["key_alias"]]
             if primary_blocked:
-                return None, blocked_candidates
+                return None
 
         if not candidates:
-            return None, blocked_candidates
+            return None
         candidates.sort(key=lambda item: _lane_health_key(item["lane"]), reverse=True)
-        return candidates[0], blocked_candidates
+        return candidates[0]
 
     if not candidates:
-        return None, blocked_candidates
+        return None
     candidates.sort(key=lambda item: _lane_health_key(item["lane"]), reverse=True)
-    return candidates[0], blocked_candidates
+    return candidates[0]
 
 
 def _dispatch_to_lane(executor, adapter, lane, group_units, request, estimated_tokens):
@@ -234,31 +263,12 @@ def _dispatch_to_lane(executor, adapter, lane, group_units, request, estimated_t
     lane["token_window"].append({"sent_at": now, "tokens": int(estimated_tokens)})
     lane["in_flight"] = True
     lane["waves_started"] += 1
+    future = executor.submit(adapter.execute_on_lane, lane["key_alias"], request, lane["step_config"])
     lane["last_started_at"] = now
-    future = executor.submit(adapter.execute_on_lane, lane["key_alias"], request, lane["step_config"], lane)
     return future
 
 
-def _update_lane_success_timing(lane: dict, request_seconds: float, runtime: dict) -> None:
-    if request_seconds <= 0:
-        return
-    alpha = float(runtime.get("throughput_ema_alpha", 0.30) or 0.30)
-    previous = lane.get("success_request_seconds_ema")
-    lane["success_request_seconds_ema"] = request_seconds if previous is None else (alpha * request_seconds + (1 - alpha) * previous)
-    lane["success_request_samples"] = int(lane.get("success_request_samples", 0) or 0) + 1
-    window = lane.get("success_request_seconds_window")
-    if window is None:
-        from collections import deque
-        window = deque(maxlen=max(1, int(runtime.get("request_timeout_window_size", 8) or 8)))
-        lane["success_request_seconds_window"] = window
-    window.append(float(request_seconds))
-
-
 def _update_lane_after_wave(lane: dict, runtime: dict, group_size: int, wave_metrics: dict):
-    previous_load_budget = lane["controller"].load_budget
-    previous_concurrency = lane["controller"].concurrency
-    previous_group_size = _lane_current_group_size(lane, runtime)
-
     controller, control_notes = choose_next_controller_state(
         controller=lane["controller"],
         runtime=runtime,
@@ -279,86 +289,7 @@ def _update_lane_after_wave(lane: dict, runtime: dict, group_size: int, wave_met
         lane["health_score"] -= float(wave_metrics.get("failure_units", 0)) / max(float(wave_metrics.get("processed_units", 1.0)), 1.0)
 
     lane["cooldown_until"] = max(lane["cooldown_until"], time.time() + cooldown)
-
-    next_group_size = _lane_current_group_size(lane, runtime)
-    control_notes.append(
-        "controller_transition"
-        f" load_budget:{int(previous_load_budget)}->{int(lane['controller'].load_budget)}"
-        f" concurrency:{previous_concurrency}->{lane['controller'].concurrency}"
-        f" group_size:{previous_group_size}->{next_group_size}"
-    )
-    if cooldown > 0:
-        control_notes.append(f"cooldown_s={cooldown:.2f}")
     return control_notes
-
-
-def _request_result_from_future(future, context):
-    try:
-        return future.result()
-    except Exception as exc:
-        elapsed = max(time.time() - context.get("dispatch_started_at", time.time()), 0.0)
-        return {
-            "request_id": context["request"].get("request_id"),
-            "status": "retryable_error",
-            "raw_output": None,
-            "error_type": "engine_dispatch_exception",
-            "error_message": str(exc),
-            "request_seconds": elapsed,
-            "request_attempt_count": 1,
-            "engine_timeout_seconds": context.get("request_timeout_seconds"),
-            "key_alias": context["lane"]["key_alias"],
-            "provider": context["lane"].get("provider"),
-            "model": context["request"].get("model"),
-        }
-
-
-def _min_blocked_delay(blocked_candidates: list[dict]) -> float | None:
-    delays = [max(item["tpm_delay"], item["cooldown_delay"]) for item in blocked_candidates]
-    delays = [delay for delay in delays if delay > 0]
-    if not delays:
-        return None
-    return max(min(delays), 0.05)
-
-
-def _blocked_candidate_note(blocked_candidates: list[dict]) -> str:
-    if not blocked_candidates:
-        return "dispatch_blocked=no_eligible_lane"
-    parts = []
-    for item in blocked_candidates[:3]:
-        reason_bits = []
-        if item["tpm_delay"] > 0:
-            reason_bits.append(f"tpm_wait_s={item['tpm_delay']:.2f}")
-        if item["cooldown_delay"] > 0:
-            reason_bits.append(f"cooldown_wait_s={item['cooldown_delay']:.2f}")
-        parts.append(
-            f"lane={item['lane']['key_alias']} {' '.join(reason_bits)} {item['tpm_state']}"
-        )
-    return "dispatch_blocked=" + " ; ".join(parts)
-
-
-def _timeout_log_bits(timeout_summary: dict) -> str:
-    return (
-        f"timeout_limit_s={float(timeout_summary['timeout_seconds']):.2f} "
-        f"timeout_source={timeout_summary['source']} "
-        f"timeout_window_samples={int(timeout_summary['window_sample_count'])} "
-        f"timeout_center_s={float(timeout_summary['window_center_seconds'] or 0.0):.2f} "
-        f"timeout_spread_s={float(timeout_summary['window_spread_seconds'] or 0.0):.2f} "
-        f"timeout_margin_s={float(timeout_summary['window_margin_seconds'] or 0.0):.2f}"
-    )
-
-
-def _success_window_bits(lane: dict) -> str:
-    samples = list(lane.get('success_request_seconds_window') or [])
-    if not samples:
-        return "success_window_samples=0 success_window_center_s=0.00 success_window_spread_s=0.00"
-    from statistics import median, pstdev
-    center = median(samples)
-    spread = pstdev(samples) if len(samples) >= 2 else 0.0
-    return (
-        f"success_window_samples={len(samples)} "
-        f"success_window_center_s={float(center):.2f} "
-        f"success_window_spread_s={float(spread):.2f}"
-    )
 
 
 def process_batches(
@@ -388,11 +319,9 @@ def process_batches(
     units_since_flush = 0
     completed_flushes = 0
     last_flush_time = time.time()
-
-    aggregate_api_request_seconds = 0.0
-    engine_processing_seconds = 0.0
     scheduler_delay_seconds = 0.0
     inflight_wait_seconds = 0.0
+    api_send_to_receive_seconds = 0.0
 
     lanes = []
     for lane in adapter.lanes:
@@ -411,9 +340,6 @@ def process_batches(
                 "health_score": 0.0,
                 "waves_started": 0,
                 "last_started_at": 0.0,
-                "success_request_seconds_ema": None,
-                "success_request_samples": 0,
-                "success_request_seconds_window": deque(maxlen=max(1, int(runtime.get("request_timeout_window_size", 8) or 8))),
                 "step_config": step_config,
             }
         )
@@ -426,15 +352,19 @@ def process_batches(
     shared_failure_events = deque()
     last_lane_limit_reduction_wave = 0
 
-    tpm_budget = tpm_budget_snapshot(runtime)
-    if tpm_budget.get("enabled"):
+    per_key_target_tpm = _per_key_target_tpm(runtime)
+    per_key_safe_budget = _lane_safe_budget(runtime)
+    pool_target_tpm = _pool_target_tpm(runtime, lanes)
+    pool_safe_budget = _pool_safe_budget(runtime, lanes)
+    if per_key_target_tpm is not None:
         print(
             (
-                f"[llm:{step_config['name']}] tpm_budget per_key_target_tpm={int(tpm_budget['per_key_target_tpm'])} "
-                f"per_key_safe_budget={int(tpm_budget['per_key_safe_budget'])} "
-                f"pool_target_tpm={int(tpm_budget['pool_target_tpm'])} "
-                f"pool_safe_budget={int(tpm_budget['pool_safe_budget'])} "
-                f"available_lanes={tpm_budget['lane_count']} active_lane_limit={current_active_lane_limit}"
+                f"[llm:{step_config['name']}] tpm_budget "
+                f"per_key_target_tpm={int(per_key_target_tpm)} "
+                f"per_key_safe_budget={int(per_key_safe_budget or 0)} "
+                f"pool_target_tpm={int(pool_target_tpm or 0)} "
+                f"pool_safe_budget={int(pool_safe_budget or 0)} "
+                f"available_lanes={len(lanes)} active_lane_limit={current_active_lane_limit}"
             ),
             flush=True,
         )
@@ -445,7 +375,7 @@ def process_batches(
             dispatch_allowed = elapsed < soft_time_limit_seconds
 
             while dispatch_allowed and pending_queue:
-                selected, blocked_candidates = _select_dispatch_lane(
+                selected = _select_dispatch_lane(
                     lanes, runtime, pending_queue, step_config, task_handler, prompt_context,
                     active_lane_limit=current_active_lane_limit,
                     current_primary_lane=current_primary_lane,
@@ -457,24 +387,11 @@ def process_batches(
                 group_units = selected["group_units"]
                 request = selected["request"]
                 estimated_tokens = selected["estimated_tokens"]
-                timeout_summary = timeout_window_summary(step_config, lane)
-                request_timeout_seconds = float(timeout_summary["timeout_seconds"])
                 for _ in range(len(group_units)):
                     pending_queue.popleft()
                 attempted_dispatch_units += len(group_units)
                 wave_index += 1
-                rolling_tokens = rolling_window_tokens(lane["token_window"], time.time())
-                log_note = (
-                    f"event=request_sent lane={lane['key_alias']} groups=1 batch_units={len(group_units)} "
-                    f"requested_group_size={selected['requested_group_size']} effective_group_size={len(group_units)} "
-                    f"estimated_request_tokens={estimated_tokens} lane_rolling_tokens={rolling_tokens} "
-                    f"{selected['tpm_state']} lane_strategy={lane_strategy} active_lane_limit={current_active_lane_limit} "
-                    f"{_timeout_log_bits(timeout_summary)}"
-                )
-                if selected.get("resize_note"):
-                    log_note += f" {selected['resize_note']}"
-                if blocked_candidates:
-                    log_note += f" spillover_context={_blocked_candidate_note(blocked_candidates)}"
+                rolling_tokens = _rolling_window_tokens(lane["token_window"], time.time())
                 log_progress(
                     step_name=step_config["name"],
                     wave_index=wave_index,
@@ -486,7 +403,15 @@ def process_batches(
                     current_load_budget=lane["controller"].load_budget,
                     success_streak=lane["controller"].good_wave_streak,
                     progress_by_unit=progress_by_unit,
-                    note=log_note,
+                    note=(
+                        f"event=request_sent lane={lane['key_alias']} groups=1 batch_units={len(group_units)} "
+                        f"requested_group_size={len(group_units)} effective_group_size={len(group_units)} "
+                        f"estimated_request_tokens={estimated_tokens} lane_rolling_tokens={rolling_tokens} "
+                        f"tpm=per_key_safe_budget:{int(per_key_safe_budget or 0)} pool_safe_budget:{int(pool_safe_budget or 0)} "
+                        f"per_key_target_tpm:{int(per_key_target_tpm or 0)} pool_target_tpm:{int(pool_target_tpm or 0)} lane_count:{len(lanes)} "
+                        f"wait_s:0.00 lane_strategy={lane_strategy} active_lane_limit={current_active_lane_limit} "
+                        f"timeout_limit_s={float(runtime.get('max_request_wall_time_seconds', 300) or 300):.2f}"
+                    ),
                     start_time=start_time,
                     remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                 )
@@ -497,8 +422,6 @@ def process_batches(
                     "request": request,
                     "estimated_tokens": estimated_tokens,
                     "wave_index": wave_index,
-                    "dispatch_started_at": time.time(),
-                    "request_timeout_seconds": request_timeout_seconds,
                 }
 
             if not active:
@@ -519,14 +442,14 @@ def process_batches(
                         remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                     )
                     break
-                _, blocked_candidates = _select_dispatch_lane(
-                    lanes, runtime, pending_queue, step_config, task_handler, prompt_context,
-                    active_lane_limit=current_active_lane_limit,
-                    current_primary_lane=current_primary_lane,
-                )
-                delay = _min_blocked_delay(blocked_candidates)
-                if delay is not None:
-                    scheduler_delay_seconds += delay
+                delays = [
+                    _lane_next_available_delay(lane, runtime, list(pending_queue), step_config, task_handler, prompt_context, time.time())
+                    for lane in lanes
+                ]
+                delays = [d for d in delays if d is not None]
+                if delays:
+                    imposed_wait = max(min(delays), 0.05)
+                    scheduler_delay_seconds += imposed_wait
                     log_progress(
                         step_name=step_config["name"],
                         wave_index=wave_index,
@@ -534,23 +457,21 @@ def process_batches(
                         processed_count=_terminal_units_from_statuses(progress_by_unit),
                         cursor=attempted_dispatch_units,
                         current_group_size=0,
-                        current_concurrency=sum(1 for l in lanes if l["in_flight"]),
+                        current_concurrency=current_active_lane_limit,
                         current_load_budget=sum(l["controller"].load_budget for l in lanes),
                         success_streak=0,
                         progress_by_unit=progress_by_unit,
-                        note=f"event=scheduler_wait imposed_wait_s={delay:.2f} {_blocked_candidate_note(blocked_candidates)}",
+                        note=f"event=scheduler_wait imposed_wait_s={imposed_wait:.2f}",
                         start_time=start_time,
                         remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                     )
-                    time.sleep(delay)
+                    time.sleep(imposed_wait)
                     continue
                 break
 
             timeout = None
             delays = [
-                _min_blocked_delay([
-                    _eligible_candidate_for_lane(lane, runtime, list(pending_queue), step_config, task_handler, prompt_context, time.time())
-                ])
+                _lane_next_available_delay(lane, runtime, list(pending_queue), step_config, task_handler, prompt_context, time.time())
                 for lane in lanes
                 if not lane["in_flight"]
             ]
@@ -558,23 +479,21 @@ def process_batches(
             if delays:
                 timeout = max(min(delays), 0.05)
 
-            wait_started_at = time.time()
+            wait_started = time.time()
             done, _ = wait(active.keys(), timeout=timeout, return_when=FIRST_COMPLETED)
-            inflight_wait_seconds += max(time.time() - wait_started_at, 0.0)
+            inflight_wait_seconds += max(time.time() - wait_started, 0.0)
             if not done:
                 continue
 
             for future in done:
-                processing_started_at = time.perf_counter()
                 context = active.pop(future)
                 lane = context["lane"]
                 lane["in_flight"] = False
                 group_units = context["group_units"]
                 request = context["request"]
                 group_size = len(group_units)
-                request_result = _request_result_from_future(future, context)
-                request_seconds = float(request_result.get("request_seconds", 0.0) or 0.0)
-                aggregate_api_request_seconds += request_seconds
+                request_result = future.result()
+                api_send_to_receive_seconds += float(request_result.get("request_seconds", 0.0) or 0.0)
 
                 wave_metrics = {
                     "processed_units": group_size,
@@ -583,7 +502,7 @@ def process_batches(
                     "transport_failures": 0,
                     "successful_requests": 0,
                     "total_requests": 1,
-                    "elapsed_request_seconds": request_seconds,
+                    "elapsed_request_seconds": float(request_result.get("request_seconds", 0.0) or 0.0),
                 }
 
                 if request_result["status"] != "success":
@@ -622,22 +541,17 @@ def process_batches(
                         total_units=total_units,
                         processed_count=_terminal_units_from_statuses(progress_by_unit),
                         cursor=attempted_dispatch_units,
-                        current_group_size=_lane_current_group_size(lane, runtime),
+                        current_group_size=derive_group_size(lane["controller"].load_budget, 1, runtime["min_group_size"], runtime["max_group_size"]),
                         current_concurrency=1,
                         current_load_budget=lane["controller"].load_budget,
                         success_streak=lane["controller"].good_wave_streak,
                         progress_by_unit=progress_by_unit,
-                        note=(
-                            f"lane={lane['key_alias']} wave_complete status={request_result['status']} "
-                            f"error_type={request_result.get('error_type')} api_request_s={request_seconds:.2f} "
-                            f"timeout_s={request_result.get('engine_timeout_seconds')} {'|'.join(control_notes)}"
-                        ),
+                        note=f"event=response_done lane={lane['key_alias']} status={request_result['status']} api_request_s={float(request_result.get('request_seconds',0.0) or 0.0):.2f} {'|'.join(control_notes)}",
                         start_time=start_time,
                         remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                     )
                 else:
                     try:
-                        _update_lane_success_timing(lane, request_seconds, runtime)
                         parse_results = task_handler.parse_grouped_result(
                             raw_output=request_result["raw_output"],
                             request=request,
@@ -686,7 +600,7 @@ def process_batches(
                             total_units=total_units,
                             processed_count=_terminal_units_from_statuses(progress_by_unit),
                             cursor=attempted_dispatch_units,
-                            current_group_size=_lane_current_group_size(lane, runtime),
+                            current_group_size=derive_group_size(lane["controller"].load_budget, 1, runtime["min_group_size"], runtime["max_group_size"]),
                             current_concurrency=1,
                             current_load_budget=lane["controller"].load_budget,
                             success_streak=lane["controller"].good_wave_streak,
@@ -694,9 +608,7 @@ def process_batches(
                             note=(
                                 f"event=response_done lane={lane['key_alias']} status=success useful_work={useful_work} "
                                 f"failure_units={failure_units} failure_rate={failure_units / max(group_size,1):.4f} "
-                                f"api_request_s={request_seconds:.2f} score={request_score(useful_work, max(wave_metrics['elapsed_request_seconds'],1e-9)):.4f} "
-                                f"success_ema_request_s={float(lane.get('success_request_seconds_ema') or 0.0):.2f} "
-                                f"{_success_window_bits(lane)} {'|'.join(control_notes)}"
+                                f"api_request_s={wave_metrics['elapsed_request_seconds']:.2f} score={request_score(useful_work, max(wave_metrics['elapsed_request_seconds'],1e-9)):.4f} {'|'.join(control_notes)}"
                             ),
                             start_time=start_time,
                             remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
@@ -730,17 +642,15 @@ def process_batches(
                             total_units=total_units,
                             processed_count=_terminal_units_from_statuses(progress_by_unit),
                             cursor=attempted_dispatch_units,
-                            current_group_size=_lane_current_group_size(lane, runtime),
+                            current_group_size=derive_group_size(lane["controller"].load_budget, 1, runtime["min_group_size"], runtime["max_group_size"]),
                             current_concurrency=1,
                             current_load_budget=lane["controller"].load_budget,
                             success_streak=lane["controller"].good_wave_streak,
                             progress_by_unit=progress_by_unit,
-                            note=f"event=response_done lane={lane['key_alias']} status=group_parse_exception api_request_s={request_seconds:.2f} {'|'.join(control_notes)}",
+                            note=f"event=response_done lane={lane['key_alias']} status=group_parse_exception {'|'.join(control_notes)}",
                             start_time=start_time,
                             remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                         )
-
-                engine_processing_seconds += max(time.perf_counter() - processing_started_at, 0.0)
 
                 if should_flush(
                     pending_progress_rows=pending_progress_rows,
@@ -758,7 +668,10 @@ def process_batches(
                             "debug_rows": list(pending_debug_rows),
                             "processed_units": _terminal_units_from_statuses(progress_by_unit),
                             "remaining_units": _remaining_units_from_statuses(progress_by_unit, total_units),
-                            "current_group_size": max(_lane_current_group_size(l, runtime) for l in lanes),
+                            "current_group_size": max(
+                                derive_group_size(l["controller"].load_budget, 1, runtime["min_group_size"], runtime["max_group_size"])
+                                for l in lanes
+                            ),
                             "current_concurrency": sum(1 for l in lanes if l["in_flight"]),
                             "current_load_budget": int(sum(l["controller"].load_budget for l in lanes)),
                         }
@@ -799,15 +712,17 @@ def process_batches(
     )
 
     total_wall_seconds = max(time.time() - start_time, 0.0)
+    engine_processing_seconds = max(total_wall_seconds - api_send_to_receive_seconds - scheduler_delay_seconds, 0.0)
+
     print(
         (
-            f"[llm:{step_config['name']}] "
-            f"event=run_end processed={outcome.processed_units}/{total_units} "
+            f"[llm:{step_config['name']}] event=run_end "
+            f"processed={outcome.processed_units}/{total_units} "
             f"remaining={remaining_units} "
             f"outcome={outcome.status} "
             f"completed_flushes={completed_flushes} "
             f"total_wall_s={total_wall_seconds:.2f} "
-            f"api_send_to_receive_s={aggregate_api_request_seconds:.2f} "
+            f"api_send_to_receive_s={api_send_to_receive_seconds:.2f} "
             f"engine_processing_s={engine_processing_seconds:.2f} "
             f"scheduler_delay_s={scheduler_delay_seconds:.2f} "
             f"inflight_wait_s={inflight_wait_seconds:.2f}"
@@ -815,13 +730,4 @@ def process_batches(
         flush=True,
     )
 
-    return {
-        "outcome": outcome,
-        "metrics": {
-            "total_wall_seconds": total_wall_seconds,
-            "aggregate_api_request_seconds": aggregate_api_request_seconds,
-            "engine_processing_seconds": engine_processing_seconds,
-            "scheduler_delay_seconds": scheduler_delay_seconds,
-            "inflight_wait_seconds": inflight_wait_seconds,
-        },
-    }
+    return {"outcome": outcome}
