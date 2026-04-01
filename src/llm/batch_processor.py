@@ -25,7 +25,7 @@ from .batch_tokens import (
     tpm_budget_snapshot,
 )
 from .models import LLMRunOutcome
-from .request_timeout import effective_request_timeout_seconds, timeout_window_summary
+from .request_timeout import timeout_window_summary
 from .validators import validate_grouped_parse_results
 
 
@@ -336,6 +336,31 @@ def _blocked_candidate_note(blocked_candidates: list[dict]) -> str:
     return "dispatch_blocked=" + " ; ".join(parts)
 
 
+def _timeout_log_bits(timeout_summary: dict) -> str:
+    return (
+        f"timeout_limit_s={float(timeout_summary['timeout_seconds']):.2f} "
+        f"timeout_source={timeout_summary['source']} "
+        f"timeout_window_samples={int(timeout_summary['window_sample_count'])} "
+        f"timeout_center_s={float(timeout_summary['window_center_seconds'] or 0.0):.2f} "
+        f"timeout_spread_s={float(timeout_summary['window_spread_seconds'] or 0.0):.2f} "
+        f"timeout_margin_s={float(timeout_summary['window_margin_seconds'] or 0.0):.2f}"
+    )
+
+
+def _success_window_bits(lane: dict) -> str:
+    samples = list(lane.get('success_request_seconds_window') or [])
+    if not samples:
+        return "success_window_samples=0 success_window_center_s=0.00 success_window_spread_s=0.00"
+    from statistics import median, pstdev
+    center = median(samples)
+    spread = pstdev(samples) if len(samples) >= 2 else 0.0
+    return (
+        f"success_window_samples={len(samples)} "
+        f"success_window_center_s={float(center):.2f} "
+        f"success_window_spread_s={float(spread):.2f}"
+    )
+
+
 def process_batches(
     pending_rows,
     step_config,
@@ -439,14 +464,12 @@ def process_batches(
                 attempted_dispatch_units += len(group_units)
                 wave_index += 1
                 rolling_tokens = rolling_window_tokens(lane["token_window"], time.time())
-                lane_timeout_seconds = request_timeout_seconds
                 log_note = (
-                    f"lane={lane['key_alias']} wave_start groups=1 size={len(group_units)} "
-                    f"requested_group_size={selected['requested_group_size']} estimated_next_wave_tokens={estimated_tokens} "
-                    f"rolling_tokens={rolling_tokens} {selected['tpm_state']} lane_strategy={lane_strategy} "
-                    f"active_lane_limit={current_active_lane_limit} request_timeout_s={lane_timeout_seconds:.2f} "
-                    f"timeout_source={timeout_summary['source']} timeout_window_samples={timeout_summary['window_sample_count']} "
-                    f"timeout_window_metric_s={float(timeout_summary['window_metric_seconds'] or 0.0):.2f}"
+                    f"event=request_sent lane={lane['key_alias']} groups=1 batch_units={len(group_units)} "
+                    f"requested_group_size={selected['requested_group_size']} effective_group_size={len(group_units)} "
+                    f"estimated_request_tokens={estimated_tokens} lane_rolling_tokens={rolling_tokens} "
+                    f"{selected['tpm_state']} lane_strategy={lane_strategy} active_lane_limit={current_active_lane_limit} "
+                    f"{_timeout_log_bits(timeout_summary)}"
                 )
                 if selected.get("resize_note"):
                     log_note += f" {selected['resize_note']}"
@@ -515,7 +538,7 @@ def process_batches(
                         current_load_budget=sum(l["controller"].load_budget for l in lanes),
                         success_streak=0,
                         progress_by_unit=progress_by_unit,
-                        note=f"scheduler_wait wait_s={delay:.2f} {_blocked_candidate_note(blocked_candidates)}",
+                        note=f"event=scheduler_wait imposed_wait_s={delay:.2f} {_blocked_candidate_note(blocked_candidates)}",
                         start_time=start_time,
                         remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                     )
@@ -669,12 +692,11 @@ def process_batches(
                             success_streak=lane["controller"].good_wave_streak,
                             progress_by_unit=progress_by_unit,
                             note=(
-                                f"lane={lane['key_alias']} wave_complete useful_work={useful_work} "
-                                f"failure_rate={failure_units / max(group_size,1):.4f} api_request_s={request_seconds:.2f} "
-                                f"score={request_score(useful_work, max(wave_metrics['elapsed_request_seconds'],1e-9)):.4f} "
+                                f"event=response_done lane={lane['key_alias']} status=success useful_work={useful_work} "
+                                f"failure_units={failure_units} failure_rate={failure_units / max(group_size,1):.4f} "
+                                f"api_request_s={request_seconds:.2f} score={request_score(useful_work, max(wave_metrics['elapsed_request_seconds'],1e-9)):.4f} "
                                 f"success_ema_request_s={float(lane.get('success_request_seconds_ema') or 0.0):.2f} "
-                                f"success_window_samples={len(lane.get('success_request_seconds_window') or [])} "
-                                f"success_window_median_s={float(__import__('statistics').median(list(lane.get('success_request_seconds_window') or [0.0]))):.2f} {'|'.join(control_notes)}"
+                                f"{_success_window_bits(lane)} {'|'.join(control_notes)}"
                             ),
                             start_time=start_time,
                             remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
@@ -713,7 +735,7 @@ def process_batches(
                             current_load_budget=lane["controller"].load_budget,
                             success_streak=lane["controller"].good_wave_streak,
                             progress_by_unit=progress_by_unit,
-                            note=f"lane={lane['key_alias']} wave_complete group_parse_exception api_request_s={request_seconds:.2f} {'|'.join(control_notes)}",
+                            note=f"event=response_done lane={lane['key_alias']} status=group_parse_exception api_request_s={request_seconds:.2f} {'|'.join(control_notes)}",
                             start_time=start_time,
                             remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                         )
@@ -780,12 +802,12 @@ def process_batches(
     print(
         (
             f"[llm:{step_config['name']}] "
-            f"run_end processed={outcome.processed_units}/{total_units} "
+            f"event=run_end processed={outcome.processed_units}/{total_units} "
             f"remaining={remaining_units} "
             f"outcome={outcome.status} "
             f"completed_flushes={completed_flushes} "
             f"total_wall_s={total_wall_seconds:.2f} "
-            f"aggregate_api_request_s={aggregate_api_request_seconds:.2f} "
+            f"api_send_to_receive_s={aggregate_api_request_seconds:.2f} "
             f"engine_processing_s={engine_processing_seconds:.2f} "
             f"scheduler_delay_s={scheduler_delay_seconds:.2f} "
             f"inflight_wait_s={inflight_wait_seconds:.2f}"

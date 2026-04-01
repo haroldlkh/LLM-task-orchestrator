@@ -300,7 +300,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             f"pending_units={pending_units_df.height} initial_group_size={runtime['initial_group_size']} "
             f"min_group_size={runtime['min_group_size']} max_group_size={runtime['max_group_size']} "
             f"flush_scope={runtime['flush_scope']} max_flushes_per_run={runtime['max_flushes_per_run']} "
-            f"max_concurrent_requests={runtime['max_concurrent_requests']} available_lanes={runtime.get('available_lane_count', 1)} workflow_folder={pipeline_name}"
+            f"configured_max_concurrent_requests={runtime['max_concurrent_requests']} available_lanes={runtime.get('available_lane_count', 1)} "
+            f"workflow_folder={pipeline_name}"
         ),
         flush=True,
     )

@@ -58,10 +58,12 @@ def default_runtime(step_config: dict) -> dict:
         "retry_backoff_seconds": float(runtime.get("retry_backoff_seconds", 10)),
         "request_timeout_enabled": bool(runtime.get("request_timeout_enabled", True)),
         "request_timeout_seconds": float(runtime.get("request_timeout_seconds", 300)),
-        "request_timeout_margin_multiplier": float(runtime.get("request_timeout_margin_multiplier", 2.0)),
         "request_timeout_min_success_samples": int(runtime.get("request_timeout_min_success_samples", 1)),
         "request_timeout_window_size": int(runtime.get("request_timeout_window_size", 8)),
         "request_timeout_window_statistic": runtime.get("request_timeout_window_statistic", "median"),
+        "request_timeout_spread_statistic": runtime.get("request_timeout_spread_statistic", "stdev"),
+        "request_timeout_spread_multiplier": float(runtime.get("request_timeout_spread_multiplier", 2.0)),
+        "request_timeout_min_margin_seconds": float(runtime.get("request_timeout_min_margin_seconds", 15.0)),
         "request_timeout_max_seconds": float(runtime.get("request_timeout_max_seconds", 1800)),
         "min_inter_wave_sleep_seconds": float(runtime.get("min_inter_wave_sleep_seconds", 0)),
         "transport_failure_cooldown_seconds": float(runtime.get("transport_failure_cooldown_seconds", 0)),
@@ -186,8 +188,12 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'retry_backoff_seconds' must be >= 0")
     if runtime["request_timeout_seconds"] <= 0:
         raise ValueError("LLM runtime 'request_timeout_seconds' must be > 0")
-    if runtime["request_timeout_margin_multiplier"] < 1:
-        raise ValueError("LLM runtime 'request_timeout_margin_multiplier' must be >= 1")
+    if str(runtime["request_timeout_spread_statistic"]).lower() not in {"stdev", "mad", "none"}:
+        raise ValueError("LLM runtime 'request_timeout_spread_statistic' must be one of {'stdev', 'mad', 'none'}")
+    if runtime["request_timeout_spread_multiplier"] < 0:
+        raise ValueError("LLM runtime 'request_timeout_spread_multiplier' must be >= 0")
+    if runtime["request_timeout_min_margin_seconds"] < 0:
+        raise ValueError("LLM runtime 'request_timeout_min_margin_seconds' must be >= 0")
     if runtime["request_timeout_min_success_samples"] < 1:
         raise ValueError("LLM runtime 'request_timeout_min_success_samples' must be >= 1")
     if runtime["request_timeout_window_size"] < 1:
