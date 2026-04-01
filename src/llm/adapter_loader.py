@@ -1,5 +1,6 @@
 import copy
 import importlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -45,6 +46,76 @@ class ProviderPoolAdapter:
         result["provider"] = lane.provider
         result["model"] = lane_request.get("model")
         return result
+
+    def execute_batch(self, requests: List[Dict[str, Any]], step_config: dict) -> List[Dict[str, Any]]:
+        if not requests:
+            return []
+
+        assignments: Dict[str, List[Dict[str, Any]]] = {lane.key_alias: [] for lane in self.lanes}
+        for idx, request in enumerate(requests):
+            lane = self.lanes[idx % len(self.lanes)]
+            lane_request = dict(request)
+            if lane.model:
+                lane_request["model"] = lane.model
+            assignments[lane.key_alias].append(lane_request)
+
+        results_by_request_id: Dict[str, Dict[str, Any]] = {}
+        active_lanes = [lane for lane in self.lanes if assignments[lane.key_alias]]
+
+        with ThreadPoolExecutor(max_workers=max(len(active_lanes), 1)) as executor:
+            future_to_lane = {
+                executor.submit(lane.adapter.execute_batch, assignments[lane.key_alias], step_config): lane
+                for lane in active_lanes
+            }
+            for future in as_completed(future_to_lane):
+                lane = future_to_lane[future]
+                lane_requests = assignments[lane.key_alias]
+                try:
+                    lane_results = future.result()
+                except Exception as exc:
+                    for request in lane_requests:
+                        results_by_request_id[request["request_id"]] = {
+                            "request_id": request["request_id"],
+                            "status": "retryable_error",
+                            "raw_output": None,
+                            "error_type": "wave_request_exception",
+                            "error_message": str(exc),
+                            "request_seconds": None,
+                            "request_attempt_count": 1,
+                            "key_alias": lane.key_alias,
+                            "provider": lane.provider,
+                            "model": request.get("model"),
+                        }
+                    continue
+
+                for result in lane_results:
+                    enriched = dict(result)
+                    enriched["key_alias"] = lane.key_alias
+                    enriched["provider"] = lane.provider
+                    enriched["model"] = enriched.get("model") or lane.model or next(
+                        (req.get("model") for req in lane_requests if req["request_id"] == enriched.get("request_id")),
+                        None,
+                    )
+                    results_by_request_id[enriched["request_id"]] = enriched
+
+        missing_request_ids = [request["request_id"] for request in requests if request["request_id"] not in results_by_request_id]
+        for request in requests:
+            if request["request_id"] in results_by_request_id:
+                continue
+            results_by_request_id[request["request_id"]] = {
+                "request_id": request["request_id"],
+                "status": "retryable_error",
+                "raw_output": None,
+                "error_type": "missing_lane_result",
+                "error_message": f"No result returned for request_id {request['request_id']}",
+                "request_seconds": None,
+                "request_attempt_count": 1,
+                "key_alias": None,
+                "provider": None,
+                "model": request.get("model"),
+            }
+
+        return [results_by_request_id[request["request_id"]] for request in requests]
 
 
 def load_adapter_class(adapter_config: dict):
