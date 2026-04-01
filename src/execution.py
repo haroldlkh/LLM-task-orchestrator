@@ -2,10 +2,19 @@ import os
 import shutil
 from typing import Any, Dict, List
 
+
 from loader_factory import get_loader
 from llm.artifact_retention import merged_artifact_runtime_from_executable
 from llm.executor import execute_llm_step
 from llm.state import cleanup_llm_artifacts, ensure_llm_state_layout, sanitize_name
+
+
+def _final_output_family_prefix(output_name: str) -> str:
+    parts = output_name.rsplit("_", 2)
+    if len(parts) == 3 and len(parts[1]) == 8 and len(parts[2]) == 6 and parts[1].isdigit() and parts[2].isdigit():
+        return f"{parts[0]}_"
+    return output_name
+
 
 
 def run_pipeline_steps(
@@ -109,7 +118,7 @@ def run_global_execution(
         artifact_runtime = merged_artifact_runtime_from_executable(executable)
         if artifact_runtime is not None:
             folders = ensure_llm_state_layout(dest_connector, workflow_location)
-            cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[output_name])
+            cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[_final_output_family_prefix(output_name)])
             print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
     finally:
@@ -170,7 +179,7 @@ def run_batched_execution(
             artifact_runtime = merged_artifact_runtime_from_executable(executable)
             if artifact_runtime is not None:
                 folders = ensure_llm_state_layout(dest_connector, workflow_location)
-                cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[f"{output_name}_batch_"])
+                cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[f"{_final_output_family_prefix(output_name)}batch_"])
                 print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
         finally:

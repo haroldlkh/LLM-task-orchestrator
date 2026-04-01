@@ -27,7 +27,7 @@ def merged_artifact_runtime_from_executable(executable):
         "debug" if any(rt.get("artifact_retention_mode") == "debug" for rt in llm_runtimes) else "standard"
     )
     merged["keep_last_flushes"] = max(int(rt.get("keep_last_flushes", 3)) for rt in llm_runtimes)
-    merged["keep_last_final_outputs"] = max(int(rt.get("keep_last_final_outputs", 3)) for rt in llm_runtimes)
+    merged["keep_last_final_outputs"] = max(int(rt.get("keep_last_final_outputs", 1)) for rt in llm_runtimes)
     merged["keep_last_runs"] = max(int(rt.get("keep_last_runs", 10)) for rt in llm_runtimes)
     merged["keep_all_flushes_within_kept_runs"] = any(
         bool(rt.get("keep_all_flushes_within_kept_runs", True)) for rt in llm_runtimes

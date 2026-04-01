@@ -208,7 +208,7 @@ def cleanup_llm_artifacts(
         deleted["final_outputs"] = _prune_final_outputs(
             connector=connector,
             workflow_location=folders["workflow_folder"],
-            keep_last_n=int(runtime.get("keep_last_final_outputs", 3)),
+            keep_last_n=int(runtime.get("keep_last_final_outputs", 1)),
             expected_prefixes=expected_final_output_prefixes,
         )
 
