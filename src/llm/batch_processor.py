@@ -22,6 +22,20 @@ from .validators import (
     validate_grouped_parse_results,
 )
 
+TERMINAL_STATUSES = {"success", "permanent_error"}
+
+
+def _remaining_units_from_progress(progress_by_unit: dict, total_units: int) -> int:
+    terminal = sum(1 for row in progress_by_unit.values() if row.get("status") in TERMINAL_STATUSES)
+    return max(total_units - terminal, 0)
+
+
+def _requeue_retryable_units(pending_rows: list, group_units: list, progress_rows: list) -> None:
+    status_by_unit = {row["unit_id"]: row.get("status") for row in progress_rows}
+    for unit in group_units:
+        if status_by_unit.get(unit["unit_id"]) == "retryable_error":
+            pending_rows.append(unit)
+
 
 def _estimate_request_tokens(request: dict, group_units, runtime: dict) -> int:
     chars_per_token = float(runtime.get("token_estimation_chars_per_token", 4.0) or 4.0)
@@ -397,6 +411,7 @@ def process_batches(
                 pending_progress_rows.extend(progress_rows)
                 pending_debug_rows.extend(debug_rows)
                 merge_progress_rows_in_memory(progress_by_unit, progress_rows)
+                _requeue_retryable_units(pending_rows, item["group_units"], progress_rows)
 
                 group_len = len(item["group_units"])
                 processed_count += group_len
@@ -466,6 +481,7 @@ def process_batches(
                     pending_progress_rows.extend(progress_rows)
                     pending_debug_rows.extend(debug_rows)
                     merge_progress_rows_in_memory(progress_by_unit, progress_rows)
+                    _requeue_retryable_units(pending_rows, group_units, progress_rows)
 
                     processed_count += group_len
                     cursor += group_len
@@ -510,6 +526,7 @@ def process_batches(
                     pending_result_rows.extend(result_rows)
                     pending_debug_rows.extend(debug_rows)
                     merge_progress_rows_in_memory(progress_by_unit, progress_rows)
+                    _requeue_retryable_units(pending_rows, group_units, progress_rows)
 
                     processed_count += group_len
                     cursor += group_len
@@ -554,6 +571,7 @@ def process_batches(
                     pending_progress_rows.extend(progress_rows)
                     pending_debug_rows.extend(debug_rows)
                     merge_progress_rows_in_memory(progress_by_unit, progress_rows)
+                    _requeue_retryable_units(pending_rows, group_units, progress_rows)
 
                     processed_count += group_len
                     cursor += group_len
@@ -616,7 +634,7 @@ def process_batches(
                     "result_rows": list(pending_result_rows),
                     "debug_rows": list(pending_debug_rows),
                     "processed_units": processed_count,
-                    "remaining_units": max(total_units - cursor, 0),
+                    "remaining_units": _remaining_units_from_progress(progress_by_unit, total_units),
                     "current_group_size": derive_group_size(
                         controller.load_budget,
                         controller.concurrency,
@@ -677,7 +695,7 @@ def process_batches(
                 "result_rows": list(pending_result_rows),
                 "debug_rows": list(pending_debug_rows),
                 "processed_units": processed_count,
-                "remaining_units": max(total_units - cursor, 0),
+                "remaining_units": _remaining_units_from_progress(progress_by_unit, total_units),
                 "current_group_size": derive_group_size(
                     controller.load_budget,
                     controller.concurrency,
@@ -691,7 +709,7 @@ def process_batches(
         if flush_payload and flush_payload.get("counted_flush"):
             completed_flushes += 1
 
-    remaining_units = max(total_units - processed_count, 0)
+    remaining_units = _remaining_units_from_progress(progress_by_unit, total_units)
     outcome = LLMRunOutcome(
         status="complete" if remaining_units == 0 else "retryable_incomplete",
         processed_units=processed_count,
