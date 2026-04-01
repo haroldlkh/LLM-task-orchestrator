@@ -263,7 +263,7 @@ def _dispatch_to_lane(executor, adapter, lane, group_units, request, estimated_t
     lane["token_window"].append({"sent_at": now, "tokens": int(estimated_tokens)})
     lane["in_flight"] = True
     lane["waves_started"] += 1
-    future = executor.submit(adapter.execute_on_lane, lane["key_alias"], request, lane["step_config"])
+    future = executor.submit(adapter.execute_on_lane, lane["key_alias"], request, lane["step_config"], lane)
     lane["last_started_at"] = now
     return future
 
@@ -340,6 +340,7 @@ def process_batches(
                 "health_score": 0.0,
                 "waves_started": 0,
                 "last_started_at": 0.0,
+                "success_request_seconds_window": [],
                 "step_config": step_config,
             }
         )
@@ -410,7 +411,7 @@ def process_batches(
                         f"tpm=per_key_safe_budget:{int(per_key_safe_budget or 0)} pool_safe_budget:{int(pool_safe_budget or 0)} "
                         f"per_key_target_tpm:{int(per_key_target_tpm or 0)} pool_target_tpm:{int(pool_target_tpm or 0)} lane_count:{len(lanes)} "
                         f"wait_s:0.00 lane_strategy={lane_strategy} active_lane_limit={current_active_lane_limit} "
-                        f"timeout_limit_s={float(runtime.get('max_request_wall_time_seconds', 300) or 300):.2f}"
+                        f"timeout_limit_s={float(request.get('engine_timeout_seconds', runtime.get('request_timeout_seconds', 300)) or 0.0):.2f}"
                     ),
                     start_time=start_time,
                     remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
@@ -469,7 +470,7 @@ def process_batches(
                     continue
                 break
 
-            timeout = None
+            timeout = float(runtime.get("inflight_heartbeat_seconds", 15) or 15)
             delays = [
                 _lane_next_available_delay(lane, runtime, list(pending_queue), step_config, task_handler, prompt_context, time.time())
                 for lane in lanes
@@ -477,12 +478,40 @@ def process_batches(
             ]
             delays = [d for d in delays if d is not None and d > 0]
             if delays:
-                timeout = max(min(delays), 0.05)
+                timeout = max(min(min(delays), timeout), 0.05)
+            else:
+                timeout = max(timeout, 0.05)
 
             wait_started = time.time()
             done, _ = wait(active.keys(), timeout=timeout, return_when=FIRST_COMPLETED)
-            inflight_wait_seconds += max(time.time() - wait_started, 0.0)
+            waited_for = max(time.time() - wait_started, 0.0)
+            inflight_wait_seconds += waited_for
             if not done:
+                oldest_inflight_age = 0.0
+                if active:
+                    oldest_inflight_age = max(
+                        max(time.time() - ctx["lane"].get("last_started_at", time.time()), 0.0)
+                        for ctx in active.values()
+                    )
+                remaining_soft_stop_s = max(soft_time_limit_seconds - (time.time() - start_time), 0.0)
+                log_progress(
+                    step_name=step_config["name"],
+                    wave_index=wave_index,
+                    total_units=total_units,
+                    processed_count=_terminal_units_from_statuses(progress_by_unit),
+                    cursor=attempted_dispatch_units,
+                    current_group_size=0,
+                    current_concurrency=sum(1 for l in lanes if l["in_flight"]),
+                    current_load_budget=sum(l["controller"].load_budget for l in lanes),
+                    success_streak=0,
+                    progress_by_unit=progress_by_unit,
+                    note=(
+                        f"event=inflight_wait active_requests={len(active)} waited_s={waited_for:.2f} "
+                        f"oldest_inflight_s={oldest_inflight_age:.2f} remaining_soft_stop_s={remaining_soft_stop_s:.2f}"
+                    ),
+                    start_time=start_time,
+                    remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
+                )
                 continue
 
             for future in done:
@@ -492,7 +521,21 @@ def process_batches(
                 group_units = context["group_units"]
                 request = context["request"]
                 group_size = len(group_units)
-                request_result = future.result()
+                try:
+                    request_result = future.result()
+                except Exception as exc:
+                    request_result = {
+                        "request_id": request.get("request_id"),
+                        "status": "retryable_error",
+                        "raw_output": None,
+                        "error_type": "engine_future_exception",
+                        "error_message": str(exc),
+                        "request_seconds": max(time.time() - lane.get("last_started_at", time.time()), 0.0),
+                        "request_attempt_count": 1,
+                        "key_alias": lane.get("key_alias"),
+                        "provider": lane.get("provider"),
+                        "model": lane.get("model"),
+                    }
                 api_send_to_receive_seconds += float(request_result.get("request_seconds", 0.0) or 0.0)
 
                 wave_metrics = {
@@ -546,7 +589,13 @@ def process_batches(
                         current_load_budget=lane["controller"].load_budget,
                         success_streak=lane["controller"].good_wave_streak,
                         progress_by_unit=progress_by_unit,
-                        note=f"event=response_done lane={lane['key_alias']} status={request_result['status']} api_request_s={float(request_result.get('request_seconds',0.0) or 0.0):.2f} {'|'.join(control_notes)}",
+                        note=(
+                            f"event=response_done lane={lane['key_alias']} status={request_result['status']} "
+                            f"api_request_s={float(request_result.get('request_seconds',0.0) or 0.0):.2f} "
+                            f"engine_timeout_s={float(request_result.get('engine_timeout_seconds', 0.0) or 0.0):.2f} "
+                            f"timeout_source={request_result.get('engine_timeout_source')} "
+                            f"error_type={request_result.get('error_type')} {'|'.join(control_notes)}"
+                        ),
                         start_time=start_time,
                         remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                     )
@@ -585,6 +634,12 @@ def process_batches(
                         wave_metrics["useful_work"] = useful_work
                         wave_metrics["failure_units"] = failure_units
                         wave_metrics["successful_requests"] = 1
+                        request_seconds_value = float(request_result.get("request_seconds", 0.0) or 0.0)
+                        if request_seconds_value > 0:
+                            lane["success_request_seconds_window"].append(request_seconds_value)
+                            window_size = int(runtime.get("request_timeout_window_size", 8) or 8)
+                            if len(lane["success_request_seconds_window"]) > window_size:
+                                lane["success_request_seconds_window"] = lane["success_request_seconds_window"][-window_size:]
                         control_notes = _update_lane_after_wave(lane, runtime, group_size, wave_metrics)
                         if lane_strategy == "safe_single_active":
                             current_primary_lane = lane["key_alias"]

@@ -1,10 +1,28 @@
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from __future__ import annotations
+
+from dataclasses import dataclass
+from queue import Queue
 from statistics import mean, median, pstdev
+from threading import Thread
 from typing import Any, Callable
 
 
 class EngineRequestTimeoutError(TimeoutError):
     pass
+
+
+@dataclass
+class _AsyncResult:
+    ok: bool
+    value: Any = None
+    error: BaseException | None = None
+
+
+def _run_callable(queue: Queue, func: Callable[..., Any], args: tuple, kwargs: dict) -> None:
+    try:
+        queue.put(_AsyncResult(ok=True, value=func(*args, **kwargs)))
+    except BaseException as exc:  # pragma: no cover - passthrough for engine runtime
+        queue.put(_AsyncResult(ok=False, error=exc))
 
 
 def _recent_success_seconds(lane_state: dict | None) -> list[float]:
@@ -101,12 +119,22 @@ def run_with_timeout(func: Callable[..., Any], timeout_seconds: float | None, *a
     if timeout_seconds is None:
         return func(*args, **kwargs)
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(func, *args, **kwargs)
-        try:
-            return future.result(timeout=timeout_seconds)
-        except FutureTimeoutError as exc:
-            future.cancel()
-            raise EngineRequestTimeoutError(
-                f"Engine request timeout after {timeout_seconds:.2f}s"
-            ) from exc
+    queue: Queue = Queue(maxsize=1)
+    worker = Thread(
+        target=_run_callable,
+        args=(queue, func, args, kwargs),
+        daemon=True,
+        name="engine-request-timeout-worker",
+    )
+    worker.start()
+    worker.join(timeout_seconds)
+
+    if worker.is_alive():
+        raise EngineRequestTimeoutError(
+            f"Engine terminated request after {timeout_seconds:.2f}s"
+        )
+
+    result = queue.get_nowait()
+    if result.ok:
+        return result.value
+    raise result.error

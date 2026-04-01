@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Dict, List
 
-from .request_timeout import EngineRequestTimeoutError, effective_request_timeout_seconds, run_with_timeout
+from .request_timeout import EngineRequestTimeoutError, run_with_timeout, timeout_window_summary
 
 
 @dataclass
@@ -43,7 +43,9 @@ class ProviderPoolAdapter:
         if lane.model:
             lane_request["model"] = lane.model
 
-        timeout_seconds = effective_request_timeout_seconds(step_config, lane_state)
+        timeout_summary = timeout_window_summary(step_config, lane_state)
+        timeout_seconds = None if not step_config.get("runtime", {}).get("request_timeout_enabled", True) else float(timeout_summary["timeout_seconds"])
+        lane_request["engine_timeout_seconds"] = timeout_seconds
         started_at = perf_counter()
         try:
             result = run_with_timeout(
@@ -68,6 +70,8 @@ class ProviderPoolAdapter:
         result["provider"] = lane.provider
         result["model"] = lane_request.get("model")
         result["engine_timeout_seconds"] = timeout_seconds
+        result["engine_timeout_source"] = timeout_summary["source"] if timeout_seconds is not None else None
+        result["engine_timeout_window_sample_count"] = timeout_summary["window_sample_count"] if timeout_seconds is not None else 0
         return result
 
 

@@ -65,6 +65,7 @@ def default_runtime(step_config: dict) -> dict:
         "request_timeout_spread_multiplier": float(runtime.get("request_timeout_spread_multiplier", 2.0)),
         "request_timeout_min_margin_seconds": float(runtime.get("request_timeout_min_margin_seconds", 15.0)),
         "request_timeout_max_seconds": float(runtime.get("request_timeout_max_seconds", 1800)),
+        "inflight_heartbeat_seconds": float(runtime.get("inflight_heartbeat_seconds", 15)),
         "min_inter_wave_sleep_seconds": float(runtime.get("min_inter_wave_sleep_seconds", 0)),
         "transport_failure_cooldown_seconds": float(runtime.get("transport_failure_cooldown_seconds", 0)),
         "all_transport_failure_cooldown_seconds": float(runtime.get("all_transport_failure_cooldown_seconds", 0)),
@@ -202,6 +203,8 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'request_timeout_window_statistic' must be one of {'median', 'mean'}")
     if runtime["request_timeout_max_seconds"] < runtime["request_timeout_seconds"]:
         raise ValueError("LLM runtime 'request_timeout_max_seconds' must be >= 'request_timeout_seconds'")
+    if runtime["inflight_heartbeat_seconds"] <= 0:
+        raise ValueError("LLM runtime 'inflight_heartbeat_seconds' must be > 0")
     if runtime["min_inter_wave_sleep_seconds"] < 0:
         raise ValueError("LLM runtime 'min_inter_wave_sleep_seconds' must be >= 0")
     if runtime["transport_failure_cooldown_seconds"] < 0:
