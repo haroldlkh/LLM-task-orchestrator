@@ -23,7 +23,7 @@ from .batch_tokens import (
     rolling_window_tokens,
 )
 from .models import LLMRunOutcome
-from .request_timeout import effective_request_timeout_seconds
+from .request_timeout import effective_request_timeout_seconds, timeout_window_summary
 from .validators import validate_grouped_parse_results
 
 
@@ -245,6 +245,12 @@ def _update_lane_success_timing(lane: dict, request_seconds: float, runtime: dic
     previous = lane.get("success_request_seconds_ema")
     lane["success_request_seconds_ema"] = request_seconds if previous is None else (alpha * request_seconds + (1 - alpha) * previous)
     lane["success_request_samples"] = int(lane.get("success_request_samples", 0) or 0) + 1
+    window = lane.get("success_request_seconds_window")
+    if window is None:
+        from collections import deque
+        window = deque(maxlen=max(1, int(runtime.get("request_timeout_window_size", 8) or 8)))
+        lane["success_request_seconds_window"] = window
+    window.append(float(request_seconds))
 
 
 def _update_lane_after_wave(lane: dict, runtime: dict, group_size: int, wave_metrics: dict):
@@ -359,7 +365,8 @@ def process_batches(
 
     aggregate_api_request_seconds = 0.0
     engine_processing_seconds = 0.0
-    scheduler_wait_seconds = 0.0
+    scheduler_delay_seconds = 0.0
+    inflight_wait_seconds = 0.0
 
     lanes = []
     for lane in adapter.lanes:
@@ -380,6 +387,7 @@ def process_batches(
                 "last_started_at": 0.0,
                 "success_request_seconds_ema": None,
                 "success_request_samples": 0,
+                "success_request_seconds_window": deque(maxlen=max(1, int(runtime.get("request_timeout_window_size", 8) or 8))),
                 "step_config": step_config,
             }
         )
@@ -410,7 +418,8 @@ def process_batches(
                 group_units = selected["group_units"]
                 request = selected["request"]
                 estimated_tokens = selected["estimated_tokens"]
-                request_timeout_seconds = effective_request_timeout_seconds(step_config, lane)
+                timeout_summary = timeout_window_summary(step_config, lane)
+                request_timeout_seconds = float(timeout_summary["timeout_seconds"])
                 for _ in range(len(group_units)):
                     pending_queue.popleft()
                 attempted_dispatch_units += len(group_units)
@@ -421,7 +430,9 @@ def process_batches(
                     f"lane={lane['key_alias']} wave_start groups=1 size={len(group_units)} "
                     f"requested_group_size={selected['requested_group_size']} estimated_next_wave_tokens={estimated_tokens} "
                     f"rolling_tokens={rolling_tokens} {selected['tpm_state']} lane_strategy={lane_strategy} "
-                    f"active_lane_limit={current_active_lane_limit} request_timeout_s={lane_timeout_seconds}"
+                    f"active_lane_limit={current_active_lane_limit} request_timeout_s={lane_timeout_seconds:.2f} "
+                    f"timeout_source={timeout_summary['source']} timeout_window_samples={timeout_summary['window_sample_count']} "
+                    f"timeout_window_metric_s={float(timeout_summary['window_metric_seconds'] or 0.0):.2f}"
                 )
                 if selected.get("resize_note"):
                     log_note += f" {selected['resize_note']}"
@@ -478,7 +489,7 @@ def process_batches(
                 )
                 delay = _min_blocked_delay(blocked_candidates)
                 if delay is not None:
-                    scheduler_wait_seconds += delay
+                    scheduler_delay_seconds += delay
                     log_progress(
                         step_name=step_config["name"],
                         wave_index=wave_index,
@@ -512,7 +523,7 @@ def process_batches(
 
             wait_started_at = time.time()
             done, _ = wait(active.keys(), timeout=timeout, return_when=FIRST_COMPLETED)
-            scheduler_wait_seconds += max(time.time() - wait_started_at, 0.0)
+            inflight_wait_seconds += max(time.time() - wait_started_at, 0.0)
             if not done:
                 continue
 
@@ -647,7 +658,9 @@ def process_batches(
                                 f"lane={lane['key_alias']} wave_complete useful_work={useful_work} "
                                 f"failure_rate={failure_units / max(group_size,1):.4f} api_request_s={request_seconds:.2f} "
                                 f"score={request_score(useful_work, max(wave_metrics['elapsed_request_seconds'],1e-9)):.4f} "
-                                f"success_ema_request_s={float(lane.get('success_request_seconds_ema') or 0.0):.2f} {'|'.join(control_notes)}"
+                                f"success_ema_request_s={float(lane.get('success_request_seconds_ema') or 0.0):.2f} "
+                                f"success_window_samples={len(lane.get('success_request_seconds_window') or [])} "
+                                f"success_window_median_s={float(__import__('statistics').median(list(lane.get('success_request_seconds_window') or [0.0]))):.2f} {'|'.join(control_notes)}"
                             ),
                             start_time=start_time,
                             remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
@@ -760,7 +773,8 @@ def process_batches(
             f"total_wall_s={total_wall_seconds:.2f} "
             f"aggregate_api_request_s={aggregate_api_request_seconds:.2f} "
             f"engine_processing_s={engine_processing_seconds:.2f} "
-            f"scheduler_wait_s={scheduler_wait_seconds:.2f}"
+            f"scheduler_delay_s={scheduler_delay_seconds:.2f} "
+            f"inflight_wait_s={inflight_wait_seconds:.2f}"
         ),
         flush=True,
     )
@@ -771,6 +785,7 @@ def process_batches(
             "total_wall_seconds": total_wall_seconds,
             "aggregate_api_request_seconds": aggregate_api_request_seconds,
             "engine_processing_seconds": engine_processing_seconds,
-            "scheduler_wait_seconds": scheduler_wait_seconds,
+            "scheduler_delay_seconds": scheduler_delay_seconds,
+            "inflight_wait_seconds": inflight_wait_seconds,
         },
     }

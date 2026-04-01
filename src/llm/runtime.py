@@ -60,6 +60,8 @@ def default_runtime(step_config: dict) -> dict:
         "request_timeout_seconds": float(runtime.get("request_timeout_seconds", 300)),
         "request_timeout_margin_multiplier": float(runtime.get("request_timeout_margin_multiplier", 2.0)),
         "request_timeout_min_success_samples": int(runtime.get("request_timeout_min_success_samples", 1)),
+        "request_timeout_window_size": int(runtime.get("request_timeout_window_size", 8)),
+        "request_timeout_window_statistic": runtime.get("request_timeout_window_statistic", "median"),
         "request_timeout_max_seconds": float(runtime.get("request_timeout_max_seconds", 1800)),
         "min_inter_wave_sleep_seconds": float(runtime.get("min_inter_wave_sleep_seconds", 0)),
         "transport_failure_cooldown_seconds": float(runtime.get("transport_failure_cooldown_seconds", 0)),
@@ -79,7 +81,7 @@ def default_runtime(step_config: dict) -> dict:
         "allow_spillover_when_tpm_blocked": bool(runtime.get("allow_spillover_when_tpm_blocked", True)),
         "artifact_retention_mode": runtime.get("artifact_retention_mode", "standard"),
         "keep_last_flushes": int(runtime.get("keep_last_flushes", 3)),
-        "keep_last_final_outputs": int(runtime.get("keep_last_final_outputs", 3)),
+        "keep_last_final_outputs": int(runtime.get("keep_last_final_outputs", 1)),
         "keep_last_runs": int(runtime.get("keep_last_runs", 10)),
         "keep_all_flushes_within_kept_runs": bool(runtime.get("keep_all_flushes_within_kept_runs", True)),
     }
@@ -188,6 +190,10 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'request_timeout_margin_multiplier' must be >= 1")
     if runtime["request_timeout_min_success_samples"] < 1:
         raise ValueError("LLM runtime 'request_timeout_min_success_samples' must be >= 1")
+    if runtime["request_timeout_window_size"] < 1:
+        raise ValueError("LLM runtime 'request_timeout_window_size' must be >= 1")
+    if str(runtime["request_timeout_window_statistic"]).lower() not in {"median", "mean"}:
+        raise ValueError("LLM runtime 'request_timeout_window_statistic' must be one of {'median', 'mean'}")
     if runtime["request_timeout_max_seconds"] < runtime["request_timeout_seconds"]:
         raise ValueError("LLM runtime 'request_timeout_max_seconds' must be >= 'request_timeout_seconds'")
     if runtime["min_inter_wave_sleep_seconds"] < 0:
