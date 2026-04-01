@@ -62,6 +62,11 @@ def _load_existing_progress(connector, state_folder: str, temp_dir: str) -> pl.D
 
 def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.DataFrame:
     parts = []
+
+    snapshot_df = _load_latest_parquet(connector, results_folder, "results_snapshot", temp_dir)
+    if snapshot_df is not None:
+        parts.append(snapshot_df)
+
     for obj in connector.list_objects(results_folder):
         if obj["name"].endswith(".parquet") and obj["name"].startswith("results_"):
             local_path = f"{temp_dir}/{obj['name']}"
@@ -135,6 +140,7 @@ def _flush_incremental_state(
     folders: dict,
     temp_dir: str,
     progress_df: pl.DataFrame,
+    all_results_df: pl.DataFrame,
     result_rows,
     debug_rows,
     pair_status_df: pl.DataFrame,
@@ -158,6 +164,16 @@ def _flush_incremental_state(
             location=folders["results_folder"],
             prefix="results",
             df=result_rows_to_df(result_rows),
+            temp_dir=temp_dir,
+            run_id=run_id,
+        )
+
+    if all_results_df is not None and not all_results_df.is_empty():
+        upload_versioned_parquet(
+            connector=connector,
+            location=folders["results_folder"],
+            prefix="results_snapshot",
+            df=ensure_result_df(all_results_df),
             temp_dir=temp_dir,
             run_id=run_id,
         )
@@ -217,6 +233,15 @@ def _flush_incremental_state(
         temp_dir=temp_dir,
         run_id=run_id,
     )
+    if all_results_df is not None and not all_results_df.is_empty():
+        upload_versioned_parquet(
+            connector=connector,
+            location=folders["results_folder"],
+            prefix="results_snapshot",
+            df=ensure_result_df(all_results_df),
+            temp_dir=temp_dir,
+            run_id=run_id,
+        )
 
 
 def _flush_final_state(
@@ -225,6 +250,7 @@ def _flush_final_state(
     temp_dir: str,
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
+    all_results_df: pl.DataFrame,
     metadata: dict,
     run_id: str,
 ):
@@ -277,7 +303,12 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     adapter = build_adapter(step_config["adapter"], provider_config)
 
     pool_size = int(getattr(adapter, "lane_count", getattr(adapter, "pool_size", 1)) or 1)
-    runtime["available_lane_count"] = pool_size
+    if pool_size > 1:
+        runtime["initial_concurrency"] = max(runtime["initial_concurrency"], min(pool_size, runtime["max_concurrent_requests"]))
+        runtime["max_concurrent_requests"] = max(runtime["max_concurrent_requests"], pool_size)
+        runtime["initial_load_budget"] = max(runtime["initial_load_budget"], runtime["initial_group_size"] * runtime["initial_concurrency"])
+        if runtime.get("target_tokens_per_minute") is not None:
+            runtime["target_tokens_per_minute"] = float(runtime["target_tokens_per_minute"]) * pool_size
 
     task_handler = build_task_handler(step_config["task_handler"])
     prompt_context = load_prompt_context(step_config)
@@ -300,8 +331,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             f"pending_units={pending_units_df.height} initial_group_size={runtime['initial_group_size']} "
             f"min_group_size={runtime['min_group_size']} max_group_size={runtime['max_group_size']} "
             f"flush_scope={runtime['flush_scope']} max_flushes_per_run={runtime['max_flushes_per_run']} "
-            f"configured_max_concurrent_requests={runtime['max_concurrent_requests']} available_lanes={runtime.get('available_lane_count', 1)} "
-            f"workflow_folder={pipeline_name}"
+            f"max_concurrent_requests={runtime['max_concurrent_requests']} workflow_folder={pipeline_name}"
         ),
         flush=True,
     )
@@ -316,8 +346,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
         metadata = build_runtime_metadata(step_config, work_units_df, progress_df, outcome)
         metadata["workflow_folder"] = pipeline_name
-        _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
-        cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False)
+        _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, all_results_df, metadata, run_id)
+        cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
         print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
         return merge_results_back(
             source_df,
@@ -373,6 +403,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             folders,
             temp_dir,
             progress_df,
+            all_results_df,
             payload["result_rows"],
             payload["debug_rows"],
             pair_status_df,
@@ -433,6 +464,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         folders,
         temp_dir,
         progress_df,
+        all_results_df,
         [],
         [],
         pair_status_df,
@@ -441,9 +473,9 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         runtime,
         run_id,
     )
-    _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
+    _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, all_results_df, metadata, run_id)
 
-    cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False)
+    cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
     print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
     final_merged = merge_results_back(

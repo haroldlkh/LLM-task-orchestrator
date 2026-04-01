@@ -139,16 +139,8 @@ def _prune_keep_last_n_by_prefix(connector, location: str, prefix: str, keep_las
     return len(to_delete)
 
 
-def _prune_final_outputs(connector, workflow_location: str, keep_last_n: int, expected_prefixes: list[str] | None = None) -> int:
-    expected_prefixes = [prefix for prefix in (expected_prefixes or []) if prefix]
-    objects = []
-    for obj in connector.list_objects(workflow_location):
-        name = obj["name"]
-        if not name.endswith('.parquet'):
-            continue
-        if expected_prefixes and not any(name.startswith(prefix) for prefix in expected_prefixes):
-            continue
-        objects.append(obj)
+def _prune_final_outputs(connector, workflow_location: str, keep_last_n: int) -> int:
+    objects = [obj for obj in connector.list_objects(workflow_location) if obj["name"].endswith('.parquet')]
     objects.sort(key=lambda x: x["name"])
     to_delete = objects[:-keep_last_n] if len(objects) > keep_last_n else []
     for obj in to_delete:
@@ -199,7 +191,6 @@ def cleanup_llm_artifacts(
     folders: Dict[str, str],
     runtime: dict,
     include_final_outputs: bool = True,
-    expected_final_output_prefixes: list[str] | None = None,
 ) -> Dict[str, int]:
     mode = runtime.get("artifact_retention_mode", "standard")
     deleted = {"final_outputs": 0, "artifacts": 0}
@@ -209,14 +200,13 @@ def cleanup_llm_artifacts(
             connector=connector,
             workflow_location=folders["workflow_folder"],
             keep_last_n=int(runtime.get("keep_last_final_outputs", 1)),
-            expected_prefixes=expected_final_output_prefixes,
         )
 
     if mode == "standard":
         keep_last_n = int(runtime.get("keep_last_flushes", 3))
         for folder_key, prefixes in {
             "state_folder": ["manifest", "progress", "metadata"],
-            "results_folder": ["results", "partial_output"],
+            "results_folder": ["results", "partial_output", "results_snapshot"],
             "debug_folder": ["traces", "review", "pair_status"],
         }.items():
             for prefix in prefixes:
