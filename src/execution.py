@@ -3,6 +3,7 @@ import shutil
 from typing import Any, Dict, List
 
 from loader_factory import get_loader
+from llm.artifact_retention import merged_artifact_runtime_from_executable
 from llm.executor import execute_llm_step
 from llm.state import cleanup_llm_artifacts, ensure_llm_state_layout, sanitize_name
 
@@ -60,15 +61,6 @@ def _workflow_location(dest_connector, dest_location: str, executable_name: str)
     return dest_connector.ensure_subdir(dest_location, sanitize_name(executable_name))
 
 
-def _artifact_runtime_from_executable(executable):
-    if executable.get("kind") != "pipeline":
-        return None
-    for step in executable.get("steps", []):
-        if step.get("kind") == "llm":
-            return step["config"].get("runtime", {})
-    return None
-
-
 def run_global_execution(
     source_connector,
     dest_connector,
@@ -114,10 +106,10 @@ def run_global_execution(
             result = run_pipeline_steps(executable["steps"], data, runtime_context)
 
         save_final_output(loader, result, workflow_location, dest_connector, output_name)
-        artifact_runtime = _artifact_runtime_from_executable(executable)
+        artifact_runtime = merged_artifact_runtime_from_executable(executable)
         if artifact_runtime is not None:
             folders = ensure_llm_state_layout(dest_connector, workflow_location)
-            cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime)
+            cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[output_name])
             print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
     finally:
@@ -175,10 +167,10 @@ def run_batched_execution(
 
             batch_output_name = f"{output_name}_batch_{batch_num}"
             save_final_output(loader, result, workflow_location, dest_connector, batch_output_name)
-            artifact_runtime = _artifact_runtime_from_executable(executable)
+            artifact_runtime = merged_artifact_runtime_from_executable(executable)
             if artifact_runtime is not None:
                 folders = ensure_llm_state_layout(dest_connector, workflow_location)
-                cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime)
+                cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[f"{output_name}_batch_"])
                 print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
         finally:

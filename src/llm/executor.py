@@ -321,7 +321,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         metadata = build_runtime_metadata(step_config, work_units_df, progress_df, outcome)
         metadata["workflow_folder"] = pipeline_name
         _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
-        cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
+        cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False)
         print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
         return merge_results_back(
             source_df,
@@ -447,7 +447,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     )
     _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
 
-    cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
+    cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False)
     print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
     final_merged = merge_results_back(

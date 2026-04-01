@@ -1,7 +1,10 @@
 import copy
 import importlib
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Dict, List
+
+from .request_timeout import EngineRequestTimeoutError, effective_request_timeout_seconds, run_with_timeout
 
 
 @dataclass
@@ -34,16 +37,37 @@ class ProviderPoolAdapter:
                 return lane
         raise KeyError(f"Unknown provider lane '{key_alias}'")
 
-    def execute_on_lane(self, key_alias: str, request: Dict[str, Any], step_config: dict) -> Dict[str, Any]:
+    def execute_on_lane(self, key_alias: str, request: Dict[str, Any], step_config: dict, lane_state: dict | None = None) -> Dict[str, Any]:
         lane = self.get_lane(key_alias)
         lane_request = dict(request)
         if lane.model:
             lane_request["model"] = lane.model
 
-        result = lane.adapter.execute_batch([lane_request], step_config)[0]
+        timeout_seconds = effective_request_timeout_seconds(step_config, lane_state)
+        started_at = perf_counter()
+        try:
+            result = run_with_timeout(
+                lane.adapter.execute_batch,
+                timeout_seconds,
+                [lane_request],
+                step_config,
+            )[0]
+        except EngineRequestTimeoutError as exc:
+            elapsed = perf_counter() - started_at
+            result = {
+                "request_id": lane_request.get("request_id"),
+                "status": "retryable_error",
+                "raw_output": None,
+                "error_type": "engine_request_timeout",
+                "error_message": str(exc),
+                "request_seconds": elapsed,
+                "request_attempt_count": 1,
+            }
+
         result["key_alias"] = lane.key_alias
         result["provider"] = lane.provider
         result["model"] = lane_request.get("model")
+        result["engine_timeout_seconds"] = timeout_seconds
         return result
 
 

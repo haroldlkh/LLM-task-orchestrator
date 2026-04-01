@@ -56,6 +56,11 @@ def default_runtime(step_config: dict) -> dict:
         "soft_time_limit_minutes": float(runtime.get("soft_time_limit_minutes", 40)),
         "max_request_retries": int(runtime.get("max_request_retries", 3)),
         "retry_backoff_seconds": float(runtime.get("retry_backoff_seconds", 10)),
+        "request_timeout_enabled": bool(runtime.get("request_timeout_enabled", True)),
+        "request_timeout_seconds": float(runtime.get("request_timeout_seconds", 300)),
+        "request_timeout_margin_multiplier": float(runtime.get("request_timeout_margin_multiplier", 2.0)),
+        "request_timeout_min_success_samples": int(runtime.get("request_timeout_min_success_samples", 1)),
+        "request_timeout_max_seconds": float(runtime.get("request_timeout_max_seconds", 1800)),
         "min_inter_wave_sleep_seconds": float(runtime.get("min_inter_wave_sleep_seconds", 0)),
         "transport_failure_cooldown_seconds": float(runtime.get("transport_failure_cooldown_seconds", 0)),
         "all_transport_failure_cooldown_seconds": float(runtime.get("all_transport_failure_cooldown_seconds", 0)),
@@ -177,6 +182,14 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'max_request_retries' must be >= 0")
     if runtime["retry_backoff_seconds"] < 0:
         raise ValueError("LLM runtime 'retry_backoff_seconds' must be >= 0")
+    if runtime["request_timeout_seconds"] <= 0:
+        raise ValueError("LLM runtime 'request_timeout_seconds' must be > 0")
+    if runtime["request_timeout_margin_multiplier"] < 1:
+        raise ValueError("LLM runtime 'request_timeout_margin_multiplier' must be >= 1")
+    if runtime["request_timeout_min_success_samples"] < 1:
+        raise ValueError("LLM runtime 'request_timeout_min_success_samples' must be >= 1")
+    if runtime["request_timeout_max_seconds"] < runtime["request_timeout_seconds"]:
+        raise ValueError("LLM runtime 'request_timeout_max_seconds' must be >= 'request_timeout_seconds'")
     if runtime["min_inter_wave_sleep_seconds"] < 0:
         raise ValueError("LLM runtime 'min_inter_wave_sleep_seconds' must be >= 0")
     if runtime["transport_failure_cooldown_seconds"] < 0:
