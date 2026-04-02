@@ -296,14 +296,16 @@ def build_runtime_metadata(
     progress_df: pl.DataFrame,
     outcome: LLMRunOutcome,
 ) -> dict:
-    completed_or_terminal = len(success_unit_ids(progress_df))
+    completed_success = len(success_unit_ids(progress_df))
+    completed_or_terminal = len(success_or_terminal_unit_ids(progress_df))
     return {
         "step_name": step_config["name"],
         "status": outcome.status,
         "processed_units_this_run": int(outcome.processed_units),
         "remaining_units": int(outcome.remaining_units),
         "total_units": int(work_units_df.height),
-        "completed_success_units": completed_or_terminal,
+        "completed_success_units": completed_success,
+        "completed_or_terminal_units": completed_or_terminal,
         "updated_at": utc_now_iso(),
     }
 
