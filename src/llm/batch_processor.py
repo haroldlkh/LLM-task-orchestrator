@@ -21,26 +21,8 @@ from .models import LLMRunOutcome
 from .validators import validate_grouped_parse_results
 
 
+SUCCESS_STATUSES = {"success"}
 TERMINAL_STATUSES = {"success", "permanent_error"}
-PERMANENT_ERROR_ELIGIBLE_TYPES = {
-    "invalid_score_output",
-    "invalid_cue_output",
-    "missing_prompt_unit_result",
-    "semantic_validation_failed",
-    "invalid_unit_output",
-    "missing_required_field",
-    "unknown_prompt_unit_id",
-}
-
-
-def _eligible_for_permanent_error(row: dict) -> bool:
-    if row.get("status") != "retryable_error":
-        return False
-    error_type = row.get("last_error_type")
-    if not error_type:
-        return False
-    primary_error_type = str(error_type).split("|")[0]
-    return primary_error_type in PERMANENT_ERROR_ELIGIBLE_TYPES
 
 
 def _estimate_request_tokens(request: dict, group_units, runtime: dict) -> int:
@@ -141,61 +123,19 @@ def _latest_statuses(progress_by_unit: dict) -> dict[str, str]:
 
 def _remaining_units_from_statuses(progress_by_unit: dict, total_units: int) -> int:
     statuses = _latest_statuses(progress_by_unit)
-    terminal_count = sum(1 for status in statuses.values() if status in TERMINAL_STATUSES)
-    return max(total_units - terminal_count, 0)
+    success_count = sum(1 for status in statuses.values() if status in SUCCESS_STATUSES)
+    return max(total_units - success_count, 0)
 
 
 def _terminal_units_from_statuses(progress_by_unit: dict) -> int:
     statuses = _latest_statuses(progress_by_unit)
-    return sum(1 for status in statuses.values() if status in TERMINAL_STATUSES)
+    return sum(1 for status in statuses.values() if status in SUCCESS_STATUSES)
 
-
-
-
-
-
-def _apply_retry_limits(progress_rows, runtime: dict):
-    max_retries = int(runtime.get("max_request_retries", 0) or 0)
-    if max_retries < 0:
-        return progress_rows
-    adjusted = []
-    for row in progress_rows:
-        new_row = dict(row)
-        if _eligible_for_permanent_error(new_row) and int(new_row.get("retry_count", 0) or 0) >= max_retries:
-            new_row["status"] = "permanent_error"
-            prior_error_type = new_row.get("last_error_type")
-            if prior_error_type and "max_request_retries_exhausted" not in str(prior_error_type):
-                new_row["last_error_type"] = f"{prior_error_type}|max_request_retries_exhausted"
-            elif not prior_error_type:
-                new_row["last_error_type"] = "max_request_retries_exhausted"
-            prior_error_message = new_row.get("last_error_message") or ""
-            if "engine converted to permanent_error" not in prior_error_message:
-                suffix = (
-                    f" [engine converted to permanent_error after repeated unusable unit output "
-                    f"reached retry_count={int(new_row.get('retry_count', 0) or 0)} and max_request_retries={max_retries}]"
-                )
-                new_row["last_error_message"] = f"{prior_error_message}{suffix}".strip()
-        adjusted.append(new_row)
-    return adjusted
-
-def _run_scope_status_counts(progress_by_unit: dict, run_unit_ids: set[str]) -> dict[str, int]:
-    counts = {"success": 0, "retryable_error": 0, "permanent_error": 0}
-    if not run_unit_ids:
-        return counts
-    for unit_id in run_unit_ids:
-        row = progress_by_unit.get(unit_id)
-        if not isinstance(row, dict):
-            continue
-        status = row.get("status")
-        if status in counts:
-            counts[status] += 1
-    return counts
 
 def _seed_progress_map(progress_df) -> dict:
     if progress_df is None or progress_df.is_empty():
         return {}
     progress_df = progress_df.sort(["unit_id", "updated_at"]).group_by("unit_id").tail(1)
-    progress_df = progress_df.filter(progress_df["status"] == "success") if not progress_df.is_empty() else progress_df
     return {row["unit_id"]: row for row in progress_df.iter_rows(named=True)}
 
 
@@ -324,7 +264,7 @@ def _dispatch_to_lane(executor, adapter, lane, group_units, request, estimated_t
     lane["token_window"].append({"sent_at": now, "tokens": int(estimated_tokens)})
     lane["in_flight"] = True
     lane["waves_started"] += 1
-    future = executor.submit(adapter.execute_on_lane, lane["key_alias"], request, lane["step_config"], lane)
+    future = executor.submit(adapter.execute_on_lane, lane["key_alias"], request, lane["step_config"])
     lane["last_started_at"] = now
     return future
 
@@ -366,10 +306,7 @@ def process_batches(
 ):
     pending_rows = [] if pending_rows is None else list(pending_rows)
     pending_queue = deque(pending_rows)
-    initial_pending_unit_ids = {row["unit_id"] for row in pending_rows}
-    initial_pending_units = len(initial_pending_unit_ids)
-    already_success_units = _terminal_units_from_statuses(_seed_progress_map(progress_df))
-    total_units = initial_pending_units + already_success_units
+    total_units = len({row["unit_id"] for row in pending_rows})
     soft_time_limit_seconds = runtime["soft_time_limit_minutes"] * 60
 
     pending_result_rows = []
@@ -377,8 +314,6 @@ def process_batches(
     pending_debug_rows = []
 
     progress_by_unit = _seed_progress_map(progress_df)
-    already_terminal_units = _terminal_units_from_statuses(progress_by_unit)
-    total_units = initial_pending_units + already_terminal_units
     attempted_dispatch_units = 0
     wave_index = 0
     groups_since_flush = 0
@@ -406,7 +341,6 @@ def process_batches(
                 "health_score": 0.0,
                 "waves_started": 0,
                 "last_started_at": 0.0,
-                "success_request_seconds_window": [],
                 "step_config": step_config,
             }
         )
@@ -477,13 +411,10 @@ def process_batches(
                         f"tpm=per_key_safe_budget:{int(per_key_safe_budget or 0)} pool_safe_budget:{int(pool_safe_budget or 0)} "
                         f"per_key_target_tpm:{int(per_key_target_tpm or 0)} pool_target_tpm:{int(pool_target_tpm or 0)} lane_count:{len(lanes)} "
                         f"wait_s:0.00 lane_strategy={lane_strategy} active_lane_limit={current_active_lane_limit} "
-                        f"timeout_limit_s={float(request.get('engine_timeout_seconds', runtime.get('request_timeout_seconds', 300)) or 0.0):.2f}"
+                        f"timeout_limit_s={float(runtime.get('max_request_wall_time_seconds', 300) or 300):.2f}"
                     ),
                     start_time=start_time,
                     remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
-                    run_total_units=initial_pending_units,
-                    run_status_counts=_run_scope_status_counts(progress_by_unit, initial_pending_unit_ids),
-                    queue_pending=len(pending_queue),
                 )
                 future = _dispatch_to_lane(executor, adapter, lane, group_units, request, estimated_tokens)
                 active[future] = {
@@ -539,7 +470,7 @@ def process_batches(
                     continue
                 break
 
-            timeout = float(runtime.get("inflight_heartbeat_seconds", 15) or 15)
+            timeout = None
             delays = [
                 _lane_next_available_delay(lane, runtime, list(pending_queue), step_config, task_handler, prompt_context, time.time())
                 for lane in lanes
@@ -547,43 +478,12 @@ def process_batches(
             ]
             delays = [d for d in delays if d is not None and d > 0]
             if delays:
-                timeout = max(min(min(delays), timeout), 0.05)
-            else:
-                timeout = max(timeout, 0.05)
+                timeout = max(min(delays), 0.05)
 
             wait_started = time.time()
             done, _ = wait(active.keys(), timeout=timeout, return_when=FIRST_COMPLETED)
-            waited_for = max(time.time() - wait_started, 0.0)
-            inflight_wait_seconds += waited_for
+            inflight_wait_seconds += max(time.time() - wait_started, 0.0)
             if not done:
-                oldest_inflight_age = 0.0
-                if active:
-                    oldest_inflight_age = max(
-                        max(time.time() - ctx["lane"].get("last_started_at", time.time()), 0.0)
-                        for ctx in active.values()
-                    )
-                remaining_soft_stop_s = max(soft_time_limit_seconds - (time.time() - start_time), 0.0)
-                log_progress(
-                    step_name=step_config["name"],
-                    wave_index=wave_index,
-                    total_units=total_units,
-                    processed_count=_terminal_units_from_statuses(progress_by_unit),
-                    cursor=attempted_dispatch_units,
-                    current_group_size=0,
-                    current_concurrency=sum(1 for l in lanes if l["in_flight"]),
-                    current_load_budget=sum(l["controller"].load_budget for l in lanes),
-                    success_streak=0,
-                    progress_by_unit=progress_by_unit,
-                    note=(
-                        f"event=inflight_wait active_requests={len(active)} waited_s={waited_for:.2f} "
-                        f"oldest_inflight_s={oldest_inflight_age:.2f} remaining_soft_stop_s={remaining_soft_stop_s:.2f}"
-                    ),
-                    start_time=start_time,
-                    remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
-                    run_total_units=initial_pending_units,
-                    run_status_counts=_run_scope_status_counts(progress_by_unit, initial_pending_unit_ids),
-                    queue_pending=len(pending_queue),
-                )
                 continue
 
             for future in done:
@@ -593,21 +493,7 @@ def process_batches(
                 group_units = context["group_units"]
                 request = context["request"]
                 group_size = len(group_units)
-                try:
-                    request_result = future.result()
-                except Exception as exc:
-                    request_result = {
-                        "request_id": request.get("request_id"),
-                        "status": "retryable_error",
-                        "raw_output": None,
-                        "error_type": "engine_future_exception",
-                        "error_message": str(exc),
-                        "request_seconds": max(time.time() - lane.get("last_started_at", time.time()), 0.0),
-                        "request_attempt_count": 1,
-                        "key_alias": lane.get("key_alias"),
-                        "provider": lane.get("provider"),
-                        "model": lane.get("model"),
-                    }
+                request_result = future.result()
                 api_send_to_receive_seconds += float(request_result.get("request_seconds", 0.0) or 0.0)
 
                 wave_metrics = {
@@ -628,7 +514,6 @@ def process_batches(
                         progress_df=progress_df,
                         request_attempt_count=int(request_result.get("request_attempt_count", 1) or 1),
                     )
-                    progress_rows = _apply_retry_limits(progress_rows, runtime)
                     pending_progress_rows.extend(progress_rows)
                     pending_debug_rows.extend(debug_rows)
                     merge_progress_rows_in_memory(progress_by_unit, progress_rows)
@@ -662,13 +547,7 @@ def process_batches(
                         current_load_budget=lane["controller"].load_budget,
                         success_streak=lane["controller"].good_wave_streak,
                         progress_by_unit=progress_by_unit,
-                        note=(
-                            f"event=response_done lane={lane['key_alias']} status={request_result['status']} "
-                            f"api_request_s={float(request_result.get('request_seconds',0.0) or 0.0):.2f} "
-                            f"engine_timeout_s={float(request_result.get('engine_timeout_seconds', 0.0) or 0.0):.2f} "
-                            f"timeout_source={request_result.get('engine_timeout_source')} "
-                            f"error_type={request_result.get('error_type')} {'|'.join(control_notes)}"
-                        ),
+                        note=f"event=response_done lane={lane['key_alias']} status={request_result['status']} api_request_s={float(request_result.get('request_seconds',0.0) or 0.0):.2f} {'|'.join(control_notes)}",
                         start_time=start_time,
                         remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
                     )
@@ -690,7 +569,6 @@ def process_batches(
                             progress_df=progress_df,
                             request_attempt_count=int(request_result.get("request_attempt_count", 1) or 1),
                         )
-                        progress_rows = _apply_retry_limits(progress_rows, runtime)
                         pending_progress_rows.extend(progress_rows)
                         pending_result_rows.extend(result_rows)
                         pending_debug_rows.extend(debug_rows)
@@ -708,12 +586,6 @@ def process_batches(
                         wave_metrics["useful_work"] = useful_work
                         wave_metrics["failure_units"] = failure_units
                         wave_metrics["successful_requests"] = 1
-                        request_seconds_value = float(request_result.get("request_seconds", 0.0) or 0.0)
-                        if request_seconds_value > 0:
-                            lane["success_request_seconds_window"].append(request_seconds_value)
-                            window_size = int(runtime.get("request_timeout_window_size", 8) or 8)
-                            if len(lane["success_request_seconds_window"]) > window_size:
-                                lane["success_request_seconds_window"] = lane["success_request_seconds_window"][-window_size:]
                         control_notes = _update_lane_after_wave(lane, runtime, group_size, wave_metrics)
                         if lane_strategy == "safe_single_active":
                             current_primary_lane = lane["key_alias"]
@@ -753,7 +625,6 @@ def process_batches(
                             request_attempt_count=int(request_result.get("request_attempt_count", 1) or 1),
                             request_result=request_result,
                         )
-                        progress_rows = _apply_retry_limits(progress_rows, runtime)
                         pending_progress_rows.extend(progress_rows)
                         pending_debug_rows.extend(debug_rows)
                         merge_progress_rows_in_memory(progress_by_unit, progress_rows)
@@ -835,7 +706,6 @@ def process_batches(
             completed_flushes += 1
 
     remaining_units = _remaining_units_from_statuses(progress_by_unit, total_units)
-    run_counts = _run_scope_status_counts(progress_by_unit, initial_pending_unit_ids)
     outcome = LLMRunOutcome(
         status="complete" if remaining_units == 0 else "retryable_incomplete",
         processed_units=_terminal_units_from_statuses(progress_by_unit),
@@ -850,11 +720,6 @@ def process_batches(
             f"[llm:{step_config['name']}] event=run_end "
             f"processed={outcome.processed_units}/{total_units} "
             f"remaining={remaining_units} "
-            f"run_success={run_counts['success']} "
-            f"run_retryable_error={run_counts['retryable_error']} "
-            f"run_permanent_error={run_counts['permanent_error']} "
-            f"run_processed={run_counts['success'] + run_counts['permanent_error']}/{initial_pending_units} "
-            f"run_remaining={max(initial_pending_units - (run_counts['success'] + run_counts['permanent_error']), 0)} "
             f"outcome={outcome.status} "
             f"completed_flushes={completed_flushes} "
             f"total_wall_s={total_wall_seconds:.2f} "
