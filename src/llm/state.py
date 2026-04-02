@@ -174,7 +174,7 @@ def _prune_debug_runs(connector, folders: Dict[str, str], keep_last_runs: int) -
     folder_prefixes = {
         "state_folder": ["manifest", "progress", "metadata"],
         "results_folder": ["results", "partial_output"],
-        "debug_folder": ["traces", "review", "pair_status"],
+        "debug_folder": ["traces", "review", "pair_status", "permanent_review"],
     }
     run_ids = set()
     grouped_by_folder = {}
@@ -219,7 +219,7 @@ def cleanup_llm_artifacts(
         for folder_key, prefixes in {
             "state_folder": ["manifest", "progress", "metadata"],
             "results_folder": ["results", "partial_output", "results_snapshot"],
-            "debug_folder": ["traces", "review", "pair_status"],
+            "debug_folder": ["traces", "review", "pair_status", "permanent_review"],
         }.items():
             for prefix in prefixes:
                 deleted["artifacts"] += _prune_keep_last_n_by_prefix(

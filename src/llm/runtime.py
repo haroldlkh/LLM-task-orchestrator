@@ -269,11 +269,15 @@ def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFra
     return source_df
 
 
-def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
+def success_unit_ids(progress_df: pl.DataFrame) -> set:
     if progress_df is None or progress_df.is_empty():
         return set()
     completed = progress_df.filter(pl.col("status") == "success")
     return set(completed["unit_id"].to_list())
+
+
+def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
+    return success_unit_ids(progress_df)
 
 
 def current_retry_count(progress_df: pl.DataFrame, unit_id: str) -> int:
@@ -292,7 +296,7 @@ def build_runtime_metadata(
     progress_df: pl.DataFrame,
     outcome: LLMRunOutcome,
 ) -> dict:
-    completed_or_terminal = len(success_or_terminal_unit_ids(progress_df))
+    completed_or_terminal = len(success_unit_ids(progress_df))
     return {
         "step_name": step_config["name"],
         "status": outcome.status,

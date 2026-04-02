@@ -24,7 +24,7 @@ from .runtime import (
     apply_input_row_window,
     build_runtime_metadata,
     default_runtime,
-    success_or_terminal_unit_ids,
+    success_unit_ids,
     validate_llm_step,
 )
 from .state import (
@@ -119,7 +119,7 @@ def _progress_snapshot_outcome(
     status: str,
 ) -> LLMRunOutcome:
     total_units = int(work_units_df.height)
-    completed_ids = success_or_terminal_unit_ids(progress_df)
+    completed_ids = success_unit_ids(progress_df)
     processed_units = min(len(completed_ids), total_units)
     remaining_units = max(total_units - processed_units, 0)
 
@@ -153,6 +153,7 @@ def _flush_incremental_state(
     metadata: dict,
     runtime: dict,
     run_id: str,
+    existing_permanent_review_unit_ids: set[str] | None = None,
 ):
     upload_versioned_parquet(
         connector=connector,
@@ -317,7 +318,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     existing_results_df = _load_existing_results(dest_connector, folders["results_folder"], temp_dir)
     all_results_df = ensure_result_df(existing_results_df)
 
-    completed_ids = success_or_terminal_unit_ids(progress_df)
+    completed_ids = success_unit_ids(progress_df)
     pending_units_df = work_units_df.filter(~pl.col("unit_id").is_in(list(completed_ids)))
     permanent_review_unit_ids = _load_existing_permanent_review_unit_ids(dest_connector, folders["debug_folder"], temp_dir)
 

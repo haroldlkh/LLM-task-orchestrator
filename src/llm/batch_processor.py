@@ -195,6 +195,7 @@ def _seed_progress_map(progress_df) -> dict:
     if progress_df is None or progress_df.is_empty():
         return {}
     progress_df = progress_df.sort(["unit_id", "updated_at"]).group_by("unit_id").tail(1)
+    progress_df = progress_df.filter(progress_df["status"] == "success") if not progress_df.is_empty() else progress_df
     return {row["unit_id"]: row for row in progress_df.iter_rows(named=True)}
 
 
@@ -367,8 +368,8 @@ def process_batches(
     pending_queue = deque(pending_rows)
     initial_pending_unit_ids = {row["unit_id"] for row in pending_rows}
     initial_pending_units = len(initial_pending_unit_ids)
-    already_terminal_units = _terminal_units_from_statuses(_seed_progress_map(progress_df))
-    total_units = initial_pending_units + already_terminal_units
+    already_success_units = _terminal_units_from_statuses(_seed_progress_map(progress_df))
+    total_units = initial_pending_units + already_success_units
     soft_time_limit_seconds = runtime["soft_time_limit_minutes"] * 60
 
     pending_result_rows = []
