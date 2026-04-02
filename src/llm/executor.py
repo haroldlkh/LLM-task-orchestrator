@@ -197,7 +197,7 @@ def _upload_manifest(connector, folders: dict, temp_dir: str, work_units_df: pl.
     )
 
 
-def _flush_incremental_state(
+def _flush_canonical_state(
     connector,
     folders: dict,
     temp_dir: str,
@@ -205,10 +205,7 @@ def _flush_incremental_state(
     all_results_df: pl.DataFrame,
     debug_rows,
     cumulative_permanent_review_df: pl.DataFrame,
-    pair_status_df: pl.DataFrame,
-    partial_output_df: pl.DataFrame,
     metadata: dict,
-    runtime: dict,
     run_id: str,
 ):
     written_prefixes: dict[str, set[str]] = {
@@ -227,16 +224,15 @@ def _flush_incremental_state(
     )
     written_prefixes["state_folder"].add("progress")
 
-    if all_results_df is not None and not all_results_df.is_empty():
-        upload_versioned_parquet(
-            connector=connector,
-            location=folders["results_folder"],
-            prefix="results_snapshot",
-            df=ensure_result_df(all_results_df),
-            temp_dir=temp_dir,
-            run_id=run_id,
-        )
-        written_prefixes["results_folder"].add("results_snapshot")
+    upload_versioned_parquet(
+        connector=connector,
+        location=folders["results_folder"],
+        prefix="results_snapshot",
+        df=ensure_result_df(all_results_df),
+        temp_dir=temp_dir,
+        run_id=run_id,
+    )
+    written_prefixes["results_folder"].add("results_snapshot")
 
     if debug_rows:
         debug_df = debug_rows_to_df(debug_rows)
@@ -250,9 +246,7 @@ def _flush_incremental_state(
         )
         written_prefixes["debug_folder"].add("traces")
 
-        review_df = debug_df.filter(
-            (pl.col("status") != "success") | (pl.col("review_flag") == True)
-        )
+        review_df = debug_df.filter((pl.col("status") != "success") | (pl.col("review_flag") == True))
         if not review_df.is_empty():
             upload_versioned_parquet(
                 connector=connector,
@@ -275,32 +269,6 @@ def _flush_incremental_state(
         )
         written_prefixes["debug_folder"].add("permanent_review")
 
-    if runtime["write_pair_status"] and pair_status_df is not None and not pair_status_df.is_empty():
-        upload_versioned_parquet(
-            connector=connector,
-            location=folders["debug_folder"],
-            prefix="pair_status",
-            df=pair_status_df,
-            temp_dir=temp_dir,
-            run_id=run_id,
-        )
-        written_prefixes["debug_folder"].add("pair_status")
-
-    if (
-        runtime["write_partial_merged_output"]
-        and partial_output_df is not None
-        and not partial_output_df.is_empty()
-    ):
-        upload_versioned_parquet(
-            connector=connector,
-            location=folders["results_folder"],
-            prefix="partial_output",
-            df=partial_output_df,
-            temp_dir=temp_dir,
-            run_id=run_id,
-        )
-        written_prefixes["results_folder"].add("partial_output")
-
     upload_versioned_json(
         connector=connector,
         location=folders["state_folder"],
@@ -313,12 +281,51 @@ def _flush_incremental_state(
     return written_prefixes
 
 
+def _flush_materialized_views(
+    connector,
+    folders: dict,
+    temp_dir: str,
+    pair_status_df: pl.DataFrame,
+    partial_output_df: pl.DataFrame,
+    runtime: dict,
+    run_id: str,
+):
+    written_prefixes: dict[str, set[str]] = {
+        "state_folder": set(),
+        "results_folder": set(),
+        "debug_folder": set(),
+    }
+
+    if runtime["write_pair_status"] and pair_status_df is not None and not pair_status_df.is_empty():
+        upload_versioned_parquet(
+            connector=connector,
+            location=folders["debug_folder"],
+            prefix="pair_status",
+            df=pair_status_df,
+            temp_dir=temp_dir,
+            run_id=run_id,
+        )
+        written_prefixes["debug_folder"].add("pair_status")
+
+    if runtime["write_partial_merged_output"] and partial_output_df is not None and not partial_output_df.is_empty():
+        upload_versioned_parquet(
+            connector=connector,
+            location=folders["results_folder"],
+            prefix="partial_output",
+            df=partial_output_df,
+            temp_dir=temp_dir,
+            run_id=run_id,
+        )
+        written_prefixes["results_folder"].add("partial_output")
+
+    return written_prefixes
+
+
 def _flush_final_state(
     connector,
     folders: dict,
     temp_dir: str,
     work_units_df: pl.DataFrame,
-    progress_df: pl.DataFrame,
     metadata: dict,
     run_id: str,
 ):
@@ -332,15 +339,6 @@ def _flush_final_state(
         run_id=run_id,
     )
     written_prefixes["state_folder"].add("manifest")
-    upload_versioned_parquet(
-        connector=connector,
-        location=folders["state_folder"],
-        prefix="progress",
-        df=ensure_progress_df(progress_df),
-        temp_dir=temp_dir,
-        run_id=run_id,
-    )
-    written_prefixes["state_folder"].add("progress")
     upload_versioned_json(
         connector=connector,
         location=folders["state_folder"],
@@ -352,6 +350,50 @@ def _flush_final_state(
     written_prefixes["state_folder"].add("metadata")
     return written_prefixes
 
+
+def _merge_written_prefixes(*prefix_maps):
+    merged = {"state_folder": set(), "results_folder": set(), "debug_folder": set()}
+    for prefix_map in prefix_maps:
+        if not prefix_map:
+            continue
+        for folder_key, prefixes in prefix_map.items():
+            merged.setdefault(folder_key, set()).update(prefixes)
+    return merged
+
+
+def _build_materialized_views(source_df, work_units_df, progress_df, all_results_df, step_config, task_handler, release_mode: str):
+    released_row_ids = released_row_ids_for_flush(
+        work_units_df=work_units_df,
+        progress_df=progress_df,
+        release_mode=release_mode,
+    )
+    partial_output_df = build_partial_output_df(
+        source_df=source_df,
+        all_results_df=all_results_df,
+        row_id_column=step_config["row_id_column"],
+        task_handler=task_handler,
+        step_config=step_config,
+        released_row_ids=released_row_ids,
+    )
+    pair_status_df = build_pair_status_df(
+        work_units_df=work_units_df,
+        progress_df=progress_df,
+        step_config=step_config,
+        released_row_ids=released_row_ids,
+    )
+    return released_row_ids, partial_output_df, pair_status_df
+
+
+def _should_materialize(flush_count: int, last_materialize_at: float | None, runtime: dict, force: bool = False) -> bool:
+    if force:
+        return True
+    if flush_count <= 0:
+        return False
+    if flush_count % int(runtime.get("materialize_every_n_flushes", 5)) == 0:
+        return True
+    if last_materialize_at is None:
+        return False
+    return (time.time() - last_materialize_at) >= float(runtime.get("materialize_every_n_seconds", 60))
 
 def execute_llm_step(data, step_config: dict, runtime_context: dict):
     validate_llm_step(step_config)
@@ -400,12 +442,13 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     completed_ids = _success_unit_ids_from_results(all_results_df)
     pending_units_df = work_units_df.filter(~pl.col("unit_id").is_in(list(completed_ids)))
 
+    release_mode = "strict_row_success" if runtime["flush_scope"] == "row_complete" else "unit_partial"
     print(
         (
             f"[llm:{step_config['name']}] start total_units={work_units_df.height} already_success={len(completed_ids)} "
             f"pending_units={pending_units_df.height} existing_permanent_reviews={cumulative_permanent_review_df.height} initial_group_size={runtime['initial_group_size']} "
             f"min_group_size={runtime['min_group_size']} max_group_size={runtime['max_group_size']} "
-            f"flush_scope={runtime['flush_scope']} max_flushes_per_run={runtime['max_flushes_per_run']} "
+            f"release_mode={release_mode} max_flushes_per_run={runtime['max_flushes_per_run']} "
             f"max_concurrent_requests={runtime['max_concurrent_requests']} workflow_folder={pipeline_name}"
         ),
         flush=True,
@@ -414,24 +457,14 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     _upload_manifest(dest_connector, folders, temp_dir, work_units_df, run_id)
 
     if pending_units_df.is_empty():
-        released_row_ids = released_row_ids_for_flush(
-            work_units_df=work_units_df,
-            progress_df=progress_df,
-            flush_scope=runtime["flush_scope"],
-        )
-        partial_output_df = build_partial_output_df(
+        _, partial_output_df, pair_status_df = _build_materialized_views(
             source_df=source_df,
-            all_results_df=all_results_df,
-            row_id_column=step_config["row_id_column"],
-            task_handler=task_handler,
-            step_config=step_config,
-            released_row_ids=released_row_ids,
-        )
-        pair_status_df = build_pair_status_df(
             work_units_df=work_units_df,
             progress_df=progress_df,
+            all_results_df=all_results_df,
             step_config=step_config,
-            released_row_ids=released_row_ids,
+            task_handler=task_handler,
+            release_mode=release_mode,
         )
         successful_unit_ids = _success_unit_ids_from_results(all_results_df)
         if successful_unit_ids and cumulative_permanent_review_df is not None and not cumulative_permanent_review_df.is_empty():
@@ -446,7 +479,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
         metadata = build_runtime_metadata(step_config, work_units_df, progress_df, outcome, all_results_df=all_results_df)
         metadata["workflow_folder"] = pipeline_name
-        written_prefixes = _flush_incremental_state(
+        print(f"[llm:{step_config['name']}] flush_canonical_start reason=no_pending", flush=True)
+        canonical_written = _flush_canonical_state(
             dest_connector,
             folders,
             temp_dir,
@@ -454,17 +488,25 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             all_results_df,
             [],
             cumulative_permanent_review_df,
+            metadata,
+            run_id,
+        )
+        print(f"[llm:{step_config['name']}] flush_canonical_done reason=no_pending", flush=True)
+        print(f"[llm:{step_config['name']}] flush_materialized_start reason=no_pending", flush=True)
+        materialized_written = _flush_materialized_views(
+            dest_connector,
+            folders,
+            temp_dir,
             pair_status_df,
             partial_output_df,
-            metadata,
             runtime,
             run_id,
         )
-        final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
-        for folder_key, prefixes in final_written_prefixes.items():
-            written_prefixes.setdefault(folder_key, set()).update(prefixes)
+        print(f"[llm:{step_config['name']}] flush_materialized_done reason=no_pending", flush=True)
+        final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, metadata, run_id)
+        written_prefixes = _merge_written_prefixes(canonical_written, materialized_written, final_written_prefixes)
         cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False, new_artifact_prefixes=written_prefixes)
-        print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
+        print(f"[llm:{step_config['name']}] cleanup_done reason=run_end final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
         return merge_results_back(
             source_df,
             all_results_df,
@@ -474,8 +516,12 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
 
     start_time = time.time()
+    flush_count = 0
+    last_materialize_at = time.time()
 
     def flush_callback(payload: dict):
+        nonlocal flush_count
+        nonlocal last_materialize_at
         nonlocal progress_df
         nonlocal all_results_df
         nonlocal cumulative_permanent_review_df
@@ -488,25 +534,6 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         if not new_results_df.is_empty():
             all_results_df = _merge_results(all_results_df, new_results_df)
 
-        released_row_ids = released_row_ids_for_flush(
-            work_units_df=work_units_df,
-            progress_df=progress_df,
-            flush_scope=runtime["flush_scope"],
-        )
-        partial_output_df = build_partial_output_df(
-            source_df=source_df,
-            all_results_df=all_results_df,
-            row_id_column=step_config["row_id_column"],
-            task_handler=task_handler,
-            step_config=step_config,
-            released_row_ids=released_row_ids,
-        )
-        pair_status_df = build_pair_status_df(
-            work_units_df=work_units_df,
-            progress_df=progress_df,
-            step_config=step_config,
-            released_row_ids=released_row_ids,
-        )
 
         debug_df = debug_rows_to_df(payload["debug_rows"])
         if not debug_df.is_empty():
@@ -523,6 +550,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
                 ~pl.col("unit_id").is_in(list(successful_unit_ids))
             )
 
+        flush_count += 1
         running_outcome = _progress_snapshot_outcome(
             work_units_df=work_units_df,
             progress_df=progress_df,
@@ -531,7 +559,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
         metadata = build_runtime_metadata(step_config, work_units_df, progress_df, running_outcome, all_results_df=all_results_df)
         metadata["workflow_folder"] = pipeline_name
-        written_prefixes = _flush_incremental_state(
+        print(f"[llm:{step_config['name']}] flush_canonical_start flush_count={flush_count}", flush=True)
+        canonical_written = _flush_canonical_state(
             dest_connector,
             folders,
             temp_dir,
@@ -539,13 +568,38 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             all_results_df,
             payload["debug_rows"],
             cumulative_permanent_review_df,
-            pair_status_df,
-            partial_output_df,
             metadata,
-            runtime,
             run_id,
         )
+        print(f"[llm:{step_config['name']}] flush_canonical_done flush_count={flush_count}", flush=True)
+
+        written_prefixes = canonical_written
+        if _should_materialize(flush_count, last_materialize_at, runtime):
+            print(f"[llm:{step_config['name']}] flush_materialized_start flush_count={flush_count}", flush=True)
+            _, partial_output_df, pair_status_df = _build_materialized_views(
+                source_df=source_df,
+                work_units_df=work_units_df,
+                progress_df=progress_df,
+                all_results_df=all_results_df,
+                step_config=step_config,
+                task_handler=task_handler,
+                release_mode=release_mode,
+            )
+            materialized_written = _flush_materialized_views(
+                dest_connector,
+                folders,
+                temp_dir,
+                pair_status_df,
+                partial_output_df,
+                runtime,
+                run_id,
+            )
+            last_materialize_at = time.time()
+            print(f"[llm:{step_config['name']}] flush_materialized_done flush_count={flush_count}", flush=True)
+            written_prefixes = _merge_written_prefixes(canonical_written, materialized_written)
+
         if runtime.get("artifact_retention_mode", "standard") == "standard":
+            print(f"[llm:{step_config['name']}] cleanup_start flush_count={flush_count}", flush=True)
             cleanup_summary = cleanup_llm_artifacts(
                 dest_connector,
                 folders,
@@ -554,7 +608,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
                 new_artifact_prefixes=written_prefixes,
             )
             print(
-                f"[llm:{step_config['name']}] cleanup_flush artifacts_deleted={cleanup_summary['artifacts']}",
+                f"[llm:{step_config['name']}] cleanup_done flush_count={flush_count} artifacts_deleted={cleanup_summary['artifacts']}",
                 flush=True,
             )
         return {"counted_flush": True}
@@ -571,24 +625,14 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         flush_callback=flush_callback,
     )
 
-    released_row_ids = released_row_ids_for_flush(
-        work_units_df=work_units_df,
-        progress_df=progress_df,
-        flush_scope=runtime["flush_scope"],
-    )
-    partial_output_df = build_partial_output_df(
+    _, partial_output_df, pair_status_df = _build_materialized_views(
         source_df=source_df,
-        all_results_df=all_results_df,
-        row_id_column=step_config["row_id_column"],
-        task_handler=task_handler,
-        step_config=step_config,
-        released_row_ids=released_row_ids,
-    )
-    pair_status_df = build_pair_status_df(
         work_units_df=work_units_df,
         progress_df=progress_df,
+        all_results_df=all_results_df,
         step_config=step_config,
-        released_row_ids=released_row_ids,
+        task_handler=task_handler,
+        release_mode=release_mode,
     )
 
     successful_unit_ids = _success_unit_ids_from_results(all_results_df)
@@ -599,7 +643,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
 
     metadata = build_runtime_metadata(step_config, work_units_df, progress_df, batch_out["outcome"], all_results_df=all_results_df)
     metadata["workflow_folder"] = pipeline_name
-    written_prefixes = _flush_incremental_state(
+    print(f"[llm:{step_config['name']}] flush_canonical_start reason=run_end", flush=True)
+    canonical_written = _flush_canonical_state(
         dest_connector,
         folders,
         temp_dir,
@@ -607,16 +652,25 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         all_results_df,
         [],
         cumulative_permanent_review_df,
+        metadata,
+        run_id,
+    )
+    print(f"[llm:{step_config['name']}] flush_canonical_done reason=run_end", flush=True)
+    print(f"[llm:{step_config['name']}] flush_materialized_start reason=run_end", flush=True)
+    materialized_written = _flush_materialized_views(
+        dest_connector,
+        folders,
+        temp_dir,
         pair_status_df,
         partial_output_df,
-        metadata,
         runtime,
         run_id,
     )
-    final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
-    for folder_key, prefixes in final_written_prefixes.items():
-        written_prefixes.setdefault(folder_key, set()).update(prefixes)
+    print(f"[llm:{step_config['name']}] flush_materialized_done reason=run_end", flush=True)
+    final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, metadata, run_id)
+    written_prefixes = _merge_written_prefixes(canonical_written, materialized_written, final_written_prefixes)
 
+    print(f"[llm:{step_config['name']}] cleanup_start reason=run_end", flush=True)
     cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False, new_artifact_prefixes=written_prefixes)
     print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 

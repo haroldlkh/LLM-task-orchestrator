@@ -84,6 +84,19 @@ def default_runtime(step_config: dict) -> dict:
         "allow_spillover_when_tpm_blocked": bool(runtime.get("allow_spillover_when_tpm_blocked", True)),
         "artifact_retention_mode": runtime.get("artifact_retention_mode", "standard"),
         "keep_last_flushes": int(runtime.get("keep_last_flushes", 3)),
+        "keep_last_results_snapshots": int(runtime.get("keep_last_results_snapshots", runtime.get("keep_last_flushes", 3))),
+        "keep_last_permanent_reviews": int(runtime.get("keep_last_permanent_reviews", 2)),
+        "keep_last_progress": int(runtime.get("keep_last_progress", 2)),
+        "keep_last_metadata": int(runtime.get("keep_last_metadata", 2)),
+        "keep_last_manifests": int(runtime.get("keep_last_manifests", 2)),
+        "keep_last_partial_outputs": int(runtime.get("keep_last_partial_outputs", 2)),
+        "keep_last_pair_status": int(runtime.get("keep_last_pair_status", 2)),
+        "keep_last_traces": int(runtime.get("keep_last_traces", 2)),
+        "keep_last_reviews": int(runtime.get("keep_last_reviews", 2)),
+        "materialize_every_n_flushes": int(runtime.get("materialize_every_n_flushes", 5)),
+        "materialize_every_n_seconds": int(runtime.get("materialize_every_n_seconds", 60)),
+        "write_pair_status": bool(runtime.get("write_pair_status", True)),
+        "write_partial_merged_output": bool(runtime.get("write_partial_merged_output", True)),
         "keep_last_final_outputs": int(runtime.get("keep_last_final_outputs", 1)),
         "keep_last_runs": int(runtime.get("keep_last_runs", 10)),
         "keep_all_flushes_within_kept_runs": bool(runtime.get("keep_all_flushes_within_kept_runs", True)),
@@ -235,6 +248,28 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'artifact_retention_mode' must be one of {'standard', 'debug'}")
     if runtime["keep_last_flushes"] < 1:
         raise ValueError("LLM runtime 'keep_last_flushes' must be >= 1")
+    if runtime["keep_last_results_snapshots"] < 1:
+        raise ValueError("LLM runtime 'keep_last_results_snapshots' must be >= 1")
+    if runtime["keep_last_permanent_reviews"] < 1:
+        raise ValueError("LLM runtime 'keep_last_permanent_reviews' must be >= 1")
+    if runtime["keep_last_progress"] < 1:
+        raise ValueError("LLM runtime 'keep_last_progress' must be >= 1")
+    if runtime["keep_last_metadata"] < 1:
+        raise ValueError("LLM runtime 'keep_last_metadata' must be >= 1")
+    if runtime["keep_last_manifests"] < 1:
+        raise ValueError("LLM runtime 'keep_last_manifests' must be >= 1")
+    if runtime["keep_last_partial_outputs"] < 1:
+        raise ValueError("LLM runtime 'keep_last_partial_outputs' must be >= 1")
+    if runtime["keep_last_pair_status"] < 1:
+        raise ValueError("LLM runtime 'keep_last_pair_status' must be >= 1")
+    if runtime["keep_last_traces"] < 1:
+        raise ValueError("LLM runtime 'keep_last_traces' must be >= 1")
+    if runtime["keep_last_reviews"] < 1:
+        raise ValueError("LLM runtime 'keep_last_reviews' must be >= 1")
+    if runtime["materialize_every_n_flushes"] < 1:
+        raise ValueError("LLM runtime 'materialize_every_n_flushes' must be >= 1")
+    if runtime["materialize_every_n_seconds"] < 1:
+        raise ValueError("LLM runtime 'materialize_every_n_seconds' must be >= 1")
     if runtime["keep_last_final_outputs"] < 1:
         raise ValueError("LLM runtime 'keep_last_final_outputs' must be >= 1")
     if runtime["keep_last_runs"] < 1:

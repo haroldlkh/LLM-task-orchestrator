@@ -139,6 +139,21 @@ def _prune_keep_last_n_by_prefix(connector, location: str, prefix: str, keep_las
     return len(to_delete)
 
 
+def _family_keep_count(runtime: dict, prefix: str) -> int:
+    family_keep_counts = {
+        "manifest": int(runtime.get("keep_last_manifests", runtime.get("keep_last_flushes", 3))),
+        "progress": int(runtime.get("keep_last_progress", 2)),
+        "metadata": int(runtime.get("keep_last_metadata", 2)),
+        "results_snapshot": int(runtime.get("keep_last_results_snapshots", runtime.get("keep_last_flushes", 3))),
+        "partial_output": int(runtime.get("keep_last_partial_outputs", 2)),
+        "traces": int(runtime.get("keep_last_traces", 2)),
+        "review": int(runtime.get("keep_last_reviews", 2)),
+        "pair_status": int(runtime.get("keep_last_pair_status", 2)),
+        "permanent_review": int(runtime.get("keep_last_permanent_reviews", 2)),
+    }
+    return family_keep_counts.get(prefix, int(runtime.get("keep_last_flushes", 3)))
+
+
 def _prune_final_outputs(
     connector,
     workflow_location: str,
@@ -216,7 +231,6 @@ def cleanup_llm_artifacts(
         )
 
     if mode == "standard":
-        keep_last_n = int(runtime.get("keep_last_flushes", 3))
         prune_plan = {
             "state_folder": ["manifest", "progress", "metadata"],
             "results_folder": ["results", "partial_output", "results_snapshot"],
@@ -231,7 +245,7 @@ def cleanup_llm_artifacts(
                     connector=connector,
                     location=folders[folder_key],
                     prefix=prefix,
-                    keep_last_n=keep_last_n,
+                    keep_last_n=_family_keep_count(runtime, prefix),
                 )
     else:
         deleted["artifacts"] = _prune_debug_runs(

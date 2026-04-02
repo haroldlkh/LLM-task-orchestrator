@@ -10,7 +10,7 @@ from .merge import merge_results_back
 def released_row_ids_for_flush(
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
-    flush_scope: str,
+    release_mode: str,
 ) -> list[str]:
     if progress_df.is_empty():
         return []
@@ -23,7 +23,7 @@ def released_row_ids_for_flush(
     if joined.is_empty():
         return []
 
-    if flush_scope == "unit":
+    if release_mode == "unit_partial":
         released = joined.filter(pl.col("status") == "success")
         return sorted(set(released["row_id"].to_list()))
 
@@ -154,8 +154,8 @@ def build_pair_status_df(
     )
 
     if released_row_ids:
-        base = base.with_columns(pl.col("row_id").is_in(released_row_ids).alias("released_in_this_flush"))
+        base = base.with_columns(pl.col("row_id").is_in(released_row_ids).alias("released_for_partial_output"))
     else:
-        base = base.with_columns(pl.lit(False).alias("released_in_this_flush"))
+        base = base.with_columns(pl.lit(False).alias("released_for_partial_output"))
 
     return base.drop(blocked_cols + ["_blocked_fields_list"]).sort("row_id")
