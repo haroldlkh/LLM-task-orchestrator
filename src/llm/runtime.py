@@ -272,8 +272,8 @@ def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFra
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
     if progress_df is None or progress_df.is_empty():
         return set()
-    terminal = progress_df.filter(pl.col("status").is_in(["success", "permanent_error"]))
-    return set(terminal["unit_id"].to_list())
+    completed = progress_df.filter(pl.col("status") == "success")
+    return set(completed["unit_id"].to_list())
 
 
 def current_retry_count(progress_df: pl.DataFrame, unit_id: str) -> int:

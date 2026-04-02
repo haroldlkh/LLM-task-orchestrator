@@ -22,6 +22,25 @@ from .validators import validate_grouped_parse_results
 
 
 TERMINAL_STATUSES = {"success", "permanent_error"}
+PERMANENT_ERROR_ELIGIBLE_TYPES = {
+    "invalid_score_output",
+    "invalid_cue_output",
+    "missing_prompt_unit_result",
+    "semantic_validation_failed",
+    "invalid_unit_output",
+    "missing_required_field",
+    "unknown_prompt_unit_id",
+}
+
+
+def _eligible_for_permanent_error(row: dict) -> bool:
+    if row.get("status") != "retryable_error":
+        return False
+    error_type = row.get("last_error_type")
+    if not error_type:
+        return False
+    primary_error_type = str(error_type).split("|")[0]
+    return primary_error_type in PERMANENT_ERROR_ELIGIBLE_TYPES
 
 
 def _estimate_request_tokens(request: dict, group_units, runtime: dict) -> int:
@@ -142,16 +161,19 @@ def _apply_retry_limits(progress_rows, runtime: dict):
     adjusted = []
     for row in progress_rows:
         new_row = dict(row)
-        if new_row.get("status") == "retryable_error" and int(new_row.get("retry_count", 0) or 0) >= max_retries:
+        if _eligible_for_permanent_error(new_row) and int(new_row.get("retry_count", 0) or 0) >= max_retries:
             new_row["status"] = "permanent_error"
             prior_error_type = new_row.get("last_error_type")
-            if prior_error_type:
+            if prior_error_type and "max_request_retries_exhausted" not in str(prior_error_type):
                 new_row["last_error_type"] = f"{prior_error_type}|max_request_retries_exhausted"
-            else:
+            elif not prior_error_type:
                 new_row["last_error_type"] = "max_request_retries_exhausted"
             prior_error_message = new_row.get("last_error_message") or ""
-            if "max_request_retries" not in prior_error_message:
-                suffix = f" [engine converted to permanent_error after retry_count={int(new_row.get('retry_count', 0) or 0)} reached max_request_retries={max_retries}]"
+            if "engine converted to permanent_error" not in prior_error_message:
+                suffix = (
+                    f" [engine converted to permanent_error after repeated unusable unit output "
+                    f"reached retry_count={int(new_row.get('retry_count', 0) or 0)} and max_request_retries={max_retries}]"
+                )
                 new_row["last_error_message"] = f"{prior_error_message}{suffix}".strip()
         adjusted.append(new_row)
     return adjusted

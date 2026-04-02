@@ -147,7 +147,7 @@ def build_pair_status_df(
     base = base.with_columns([
         pl.concat_list([pl.col(col_name) for col_name in blocked_cols]).alias("_blocked_fields_list"),
         (pl.col("success_unit_count") == pl.col("expected_unit_count")).alias("row_success_complete"),
-        ((pl.col("success_unit_count") + pl.col("permanent_error_count")) == pl.col("expected_unit_count")).alias("row_terminal_complete"),
+        (pl.col("success_unit_count") == pl.col("expected_unit_count")).alias("row_terminal_complete"),
     ])
     base = base.with_columns(
         pl.col("_blocked_fields_list").list.eval(pl.element().drop_nulls()).list.join(",").alias("blocked_fields")

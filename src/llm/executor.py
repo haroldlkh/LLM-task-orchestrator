@@ -72,6 +72,19 @@ def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.
     return ensure_result_df(pl.concat(parts, how="vertical_relaxed"))
 
 
+
+
+def _load_existing_permanent_review_unit_ids(connector, debug_folder: str, temp_dir: str) -> set[str]:
+    unit_ids: set[str] = set()
+    for obj in connector.list_objects(debug_folder):
+        if obj["name"].endswith(".parquet") and obj["name"].startswith("permanent_review_"):
+            local_path = f"{temp_dir}/{obj['name']}"
+            connector.download_object(obj["id"], local_path)
+            df = pl.read_parquet(local_path)
+            if "unit_id" in df.columns:
+                unit_ids.update(df["unit_id"].drop_nulls().to_list())
+    return unit_ids
+
 def _merge_progress(base_progress: pl.DataFrame, new_progress: pl.DataFrame) -> pl.DataFrame:
     if base_progress.is_empty():
         return ensure_progress_df(new_progress)
@@ -106,8 +119,8 @@ def _progress_snapshot_outcome(
     status: str,
 ) -> LLMRunOutcome:
     total_units = int(work_units_df.height)
-    terminal_ids = success_or_terminal_unit_ids(progress_df)
-    processed_units = min(len(terminal_ids), total_units)
+    completed_ids = success_or_terminal_unit_ids(progress_df)
+    processed_units = min(len(completed_ids), total_units)
     remaining_units = max(total_units - processed_units, 0)
 
     return LLMRunOutcome(
@@ -182,6 +195,21 @@ def _flush_incremental_state(
                 temp_dir=temp_dir,
                 run_id=run_id,
             )
+        permanent_review_df = debug_df.filter(pl.col("status") == "permanent_error")
+        if not permanent_review_df.is_empty():
+            if existing_permanent_review_unit_ids is None:
+                existing_permanent_review_unit_ids = set()
+            permanent_review_df = permanent_review_df.filter(~pl.col("unit_id").is_in(list(existing_permanent_review_unit_ids)))
+            if not permanent_review_df.is_empty():
+                upload_versioned_parquet(
+                    connector=connector,
+                    location=folders["debug_folder"],
+                    prefix="permanent_review",
+                    df=permanent_review_df,
+                    temp_dir=temp_dir,
+                    run_id=run_id,
+                )
+                existing_permanent_review_unit_ids.update(permanent_review_df["unit_id"].drop_nulls().to_list())
 
     if runtime["write_pair_status"] and pair_status_df is not None and not pair_status_df.is_empty():
         upload_versioned_parquet(
@@ -289,13 +317,14 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     existing_results_df = _load_existing_results(dest_connector, folders["results_folder"], temp_dir)
     all_results_df = ensure_result_df(existing_results_df)
 
-    terminal_ids = success_or_terminal_unit_ids(progress_df)
-    pending_units_df = work_units_df.filter(~pl.col("unit_id").is_in(list(terminal_ids)))
+    completed_ids = success_or_terminal_unit_ids(progress_df)
+    pending_units_df = work_units_df.filter(~pl.col("unit_id").is_in(list(completed_ids)))
+    permanent_review_unit_ids = _load_existing_permanent_review_unit_ids(dest_connector, folders["debug_folder"], temp_dir)
 
     print(
         (
-            f"[llm:{step_config['name']}] start total_units={work_units_df.height} already_terminal={len(terminal_ids)} "
-            f"pending_units={pending_units_df.height} initial_group_size={runtime['initial_group_size']} "
+            f"[llm:{step_config['name']}] start total_units={work_units_df.height} already_success={len(completed_ids)} "
+            f"pending_units={pending_units_df.height} existing_permanent_reviews={len(permanent_review_unit_ids)} initial_group_size={runtime['initial_group_size']} "
             f"min_group_size={runtime['min_group_size']} max_group_size={runtime['max_group_size']} "
             f"flush_scope={runtime['flush_scope']} max_flushes_per_run={runtime['max_flushes_per_run']} "
             f"max_concurrent_requests={runtime['max_concurrent_requests']} workflow_folder={pipeline_name}"
@@ -377,6 +406,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             metadata,
             runtime,
             run_id,
+            permanent_review_unit_ids,
         )
         if runtime.get("artifact_retention_mode", "standard") == "standard":
             cleanup_summary = cleanup_llm_artifacts(
@@ -437,6 +467,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         metadata,
         runtime,
         run_id,
+        permanent_review_unit_ids,
     )
     _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
 
