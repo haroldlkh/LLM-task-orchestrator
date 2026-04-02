@@ -21,8 +21,8 @@ from .models import LLMRunOutcome
 from .validators import validate_grouped_parse_results
 
 
-SUCCESS_STATUSES = {"success"}
-TERMINAL_STATUSES = {"success", "permanent_error"}
+SAME_RUN_TERMINAL_STATUSES = {"success", "permanent_error"}
+COMPLETED_STATUSES = {"success"}
 
 
 def _estimate_request_tokens(request: dict, group_units, runtime: dict) -> int:
@@ -123,13 +123,13 @@ def _latest_statuses(progress_by_unit: dict) -> dict[str, str]:
 
 def _remaining_units_from_statuses(progress_by_unit: dict, total_units: int) -> int:
     statuses = _latest_statuses(progress_by_unit)
-    success_count = sum(1 for status in statuses.values() if status in SUCCESS_STATUSES)
-    return max(total_units - success_count, 0)
+    terminal_count = sum(1 for status in statuses.values() if status in COMPLETED_STATUSES)
+    return max(total_units - terminal_count, 0)
 
 
 def _terminal_units_from_statuses(progress_by_unit: dict) -> int:
     statuses = _latest_statuses(progress_by_unit)
-    return sum(1 for status in statuses.values() if status in SUCCESS_STATUSES)
+    return sum(1 for status in statuses.values() if status in COMPLETED_STATUSES)
 
 
 def _seed_progress_map(progress_df) -> dict:
