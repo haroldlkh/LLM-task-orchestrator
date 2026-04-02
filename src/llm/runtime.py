@@ -65,6 +65,7 @@ def default_runtime(step_config: dict) -> dict:
         "request_timeout_spread_multiplier": float(runtime.get("request_timeout_spread_multiplier", 2.0)),
         "request_timeout_min_margin_seconds": float(runtime.get("request_timeout_min_margin_seconds", 15.0)),
         "request_timeout_max_seconds": float(runtime.get("request_timeout_max_seconds", 1800)),
+        "inflight_heartbeat_seconds": float(runtime.get("inflight_heartbeat_seconds", 15)),
         "min_inter_wave_sleep_seconds": float(runtime.get("min_inter_wave_sleep_seconds", 0)),
         "transport_failure_cooldown_seconds": float(runtime.get("transport_failure_cooldown_seconds", 0)),
         "all_transport_failure_cooldown_seconds": float(runtime.get("all_transport_failure_cooldown_seconds", 0)),
@@ -202,6 +203,8 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'request_timeout_window_statistic' must be one of {'median', 'mean'}")
     if runtime["request_timeout_max_seconds"] < runtime["request_timeout_seconds"]:
         raise ValueError("LLM runtime 'request_timeout_max_seconds' must be >= 'request_timeout_seconds'")
+    if runtime["inflight_heartbeat_seconds"] <= 0:
+        raise ValueError("LLM runtime 'inflight_heartbeat_seconds' must be > 0")
     if runtime["min_inter_wave_sleep_seconds"] < 0:
         raise ValueError("LLM runtime 'min_inter_wave_sleep_seconds' must be >= 0")
     if runtime["transport_failure_cooldown_seconds"] < 0:
@@ -269,15 +272,12 @@ def apply_input_row_window(source_df: pl.DataFrame, runtime: dict) -> pl.DataFra
 def success_unit_ids(progress_df: pl.DataFrame) -> set:
     if progress_df is None or progress_df.is_empty():
         return set()
-    success = progress_df.filter(pl.col("status") == "success")
-    return set(success["unit_id"].to_list())
+    completed = progress_df.filter(pl.col("status") == "success")
+    return set(completed["unit_id"].to_list())
 
 
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
-    if progress_df is None or progress_df.is_empty():
-        return set()
-    terminal = progress_df.filter(pl.col("status").is_in(["success", "permanent_error"]))
-    return set(terminal["unit_id"].to_list())
+    return success_unit_ids(progress_df)
 
 
 def current_retry_count(progress_df: pl.DataFrame, unit_id: str) -> int:
@@ -296,15 +296,13 @@ def build_runtime_metadata(
     progress_df: pl.DataFrame,
     outcome: LLMRunOutcome,
 ) -> dict:
-    completed_success = len(success_unit_ids(progress_df))
-    completed_or_terminal = len(success_or_terminal_unit_ids(progress_df))
+    completed_or_terminal = len(success_unit_ids(progress_df))
     return {
         "step_name": step_config["name"],
         "status": outcome.status,
         "processed_units_this_run": int(outcome.processed_units),
         "remaining_units": int(outcome.remaining_units),
         "total_units": int(work_units_df.height),
-        "completed_success_units": completed_success,
         "completed_or_terminal_units": completed_or_terminal,
         "updated_at": utc_now_iso(),
     }
