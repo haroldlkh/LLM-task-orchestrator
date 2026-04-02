@@ -11,6 +11,7 @@ from .batch_flush import (
 from .batch_processor import process_batches
 from .dataframes import (
     debug_rows_to_df,
+    ensure_debug_df,
     ensure_progress_df,
     ensure_result_df,
     progress_rows_to_df,
@@ -61,6 +62,10 @@ def _load_existing_progress(connector, state_folder: str, temp_dir: str) -> pl.D
 
 
 def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.DataFrame:
+    snapshot_df = _load_latest_parquet(connector, results_folder, "results_snapshot_", temp_dir)
+    if snapshot_df is not None:
+        return ensure_result_df(snapshot_df)
+
     parts = []
     for obj in connector.list_objects(results_folder):
         if obj["name"].endswith(".parquet") and obj["name"].startswith("results_"):
@@ -72,18 +77,11 @@ def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.
     return ensure_result_df(pl.concat(parts, how="vertical_relaxed"))
 
 
-
-
-def _load_existing_permanent_review_unit_ids(connector, debug_folder: str, temp_dir: str) -> set[str]:
-    unit_ids: set[str] = set()
-    for obj in connector.list_objects(debug_folder):
-        if obj["name"].endswith(".parquet") and obj["name"].startswith("permanent_review_"):
-            local_path = f"{temp_dir}/{obj['name']}"
-            connector.download_object(obj["id"], local_path)
-            df = pl.read_parquet(local_path)
-            if "unit_id" in df.columns:
-                unit_ids.update(df["unit_id"].drop_nulls().to_list())
-    return unit_ids
+def _load_existing_debug_snapshot(connector, debug_folder: str, prefix: str, temp_dir: str) -> pl.DataFrame:
+    df = _load_latest_parquet(connector, debug_folder, f"{prefix}_", temp_dir)
+    if df is None:
+        return ensure_debug_df(pl.DataFrame())
+    return ensure_debug_df(df)
 
 def _merge_progress(base_progress: pl.DataFrame, new_progress: pl.DataFrame) -> pl.DataFrame:
     if base_progress.is_empty():
@@ -107,19 +105,24 @@ def _merge_results(base_results: pl.DataFrame, new_results: pl.DataFrame) -> pl.
     combined = pl.concat(
         [ensure_result_df(base_results), ensure_result_df(new_results)],
         how="vertical_relaxed",
+    ).with_row_index("_merge_order")
+    latest = (
+        combined
+        .group_by(["unit_id", "output_column"])
+        .agg(pl.all().sort_by("_merge_order").last())
+        .drop("_merge_order")
     )
-    combined = combined.sort(["unit_id", "output_column"])
-    latest = combined.group_by(["unit_id", "output_column"]).tail(1)
     return ensure_result_df(latest)
 
 
 def _progress_snapshot_outcome(
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
+    all_results_df: pl.DataFrame,
     status: str,
 ) -> LLMRunOutcome:
     total_units = int(work_units_df.height)
-    completed_ids = success_unit_ids(progress_df)
+    completed_ids = _success_unit_ids_from_results(all_results_df)
     processed_units = min(len(completed_ids), total_units)
     remaining_units = max(total_units - processed_units, 0)
 
@@ -128,6 +131,59 @@ def _progress_snapshot_outcome(
         processed_units=processed_units,
         remaining_units=remaining_units,
     )
+
+
+def _success_unit_ids_from_results(results_df: pl.DataFrame) -> set[str]:
+    if results_df is None or results_df.is_empty():
+        return set()
+    success_df = results_df.filter(pl.col("status") == "success")
+    if success_df.is_empty():
+        return set()
+    return set(success_df["unit_id"].drop_nulls().to_list())
+
+
+def _reconcile_progress_with_results(progress_df: pl.DataFrame, results_df: pl.DataFrame) -> pl.DataFrame:
+    progress_df = ensure_progress_df(progress_df)
+    result_success_ids = _success_unit_ids_from_results(results_df)
+    if not result_success_ids:
+        return progress_df
+
+    existing_success_ids = success_unit_ids(progress_df)
+    missing_ids = sorted(result_success_ids - existing_success_ids)
+    if not missing_ids:
+        return progress_df
+
+    synthetic_rows = [
+        {
+            "unit_id": unit_id,
+            "status": "success",
+            "retry_count": 0,
+            "last_error_type": None,
+            "last_error_message": None,
+            "updated_at": utc_now_run_id(),
+        }
+        for unit_id in missing_ids
+    ]
+    return _merge_progress(progress_df, progress_rows_to_df(synthetic_rows))
+
+
+def _merge_debug_latest(base_debug_df: pl.DataFrame, new_debug_df: pl.DataFrame) -> pl.DataFrame:
+    if new_debug_df is None or new_debug_df.is_empty():
+        return ensure_debug_df(base_debug_df)
+    if base_debug_df is None or base_debug_df.is_empty():
+        return ensure_debug_df(new_debug_df)
+
+    combined = pl.concat(
+        [ensure_debug_df(base_debug_df), ensure_debug_df(new_debug_df)],
+        how="vertical_relaxed",
+    ).with_row_index("_merge_order")
+    latest = (
+        combined
+        .group_by("unit_id")
+        .agg(pl.all().sort_by("_merge_order").last())
+        .drop("_merge_order")
+    )
+    return ensure_debug_df(latest)
 
 
 def _upload_manifest(connector, folders: dict, temp_dir: str, work_units_df: pl.DataFrame, run_id: str):
@@ -146,15 +202,21 @@ def _flush_incremental_state(
     folders: dict,
     temp_dir: str,
     progress_df: pl.DataFrame,
-    result_rows,
+    all_results_df: pl.DataFrame,
     debug_rows,
+    cumulative_permanent_review_df: pl.DataFrame,
     pair_status_df: pl.DataFrame,
     partial_output_df: pl.DataFrame,
     metadata: dict,
     runtime: dict,
     run_id: str,
-    existing_permanent_review_unit_ids: set[str] | None = None,
 ):
+    written_prefixes: dict[str, set[str]] = {
+        "state_folder": set(),
+        "results_folder": set(),
+        "debug_folder": set(),
+    }
+
     upload_versioned_parquet(
         connector=connector,
         location=folders["state_folder"],
@@ -163,16 +225,18 @@ def _flush_incremental_state(
         temp_dir=temp_dir,
         run_id=run_id,
     )
+    written_prefixes["state_folder"].add("progress")
 
-    if result_rows:
+    if all_results_df is not None and not all_results_df.is_empty():
         upload_versioned_parquet(
             connector=connector,
             location=folders["results_folder"],
-            prefix="results",
-            df=result_rows_to_df(result_rows),
+            prefix="results_snapshot",
+            df=ensure_result_df(all_results_df),
             temp_dir=temp_dir,
             run_id=run_id,
         )
+        written_prefixes["results_folder"].add("results_snapshot")
 
     if debug_rows:
         debug_df = debug_rows_to_df(debug_rows)
@@ -184,6 +248,8 @@ def _flush_incremental_state(
             temp_dir=temp_dir,
             run_id=run_id,
         )
+        written_prefixes["debug_folder"].add("traces")
+
         review_df = debug_df.filter(
             (pl.col("status") != "success") | (pl.col("review_flag") == True)
         )
@@ -196,21 +262,18 @@ def _flush_incremental_state(
                 temp_dir=temp_dir,
                 run_id=run_id,
             )
-        permanent_review_df = debug_df.filter(pl.col("status") == "permanent_error")
-        if not permanent_review_df.is_empty():
-            if existing_permanent_review_unit_ids is None:
-                existing_permanent_review_unit_ids = set()
-            permanent_review_df = permanent_review_df.filter(~pl.col("unit_id").is_in(list(existing_permanent_review_unit_ids)))
-            if not permanent_review_df.is_empty():
-                upload_versioned_parquet(
-                    connector=connector,
-                    location=folders["debug_folder"],
-                    prefix="permanent_review",
-                    df=permanent_review_df,
-                    temp_dir=temp_dir,
-                    run_id=run_id,
-                )
-                existing_permanent_review_unit_ids.update(permanent_review_df["unit_id"].drop_nulls().to_list())
+            written_prefixes["debug_folder"].add("review")
+
+    if cumulative_permanent_review_df is not None and not cumulative_permanent_review_df.is_empty():
+        upload_versioned_parquet(
+            connector=connector,
+            location=folders["debug_folder"],
+            prefix="permanent_review",
+            df=ensure_debug_df(cumulative_permanent_review_df),
+            temp_dir=temp_dir,
+            run_id=run_id,
+        )
+        written_prefixes["debug_folder"].add("permanent_review")
 
     if runtime["write_pair_status"] and pair_status_df is not None and not pair_status_df.is_empty():
         upload_versioned_parquet(
@@ -221,6 +284,7 @@ def _flush_incremental_state(
             temp_dir=temp_dir,
             run_id=run_id,
         )
+        written_prefixes["debug_folder"].add("pair_status")
 
     if (
         runtime["write_partial_merged_output"]
@@ -235,6 +299,7 @@ def _flush_incremental_state(
             temp_dir=temp_dir,
             run_id=run_id,
         )
+        written_prefixes["results_folder"].add("partial_output")
 
     upload_versioned_json(
         connector=connector,
@@ -244,6 +309,8 @@ def _flush_incremental_state(
         temp_dir=temp_dir,
         run_id=run_id,
     )
+    written_prefixes["state_folder"].add("metadata")
+    return written_prefixes
 
 
 def _flush_final_state(
@@ -255,6 +322,7 @@ def _flush_final_state(
     metadata: dict,
     run_id: str,
 ):
+    written_prefixes = {"state_folder": set(), "results_folder": set(), "debug_folder": set()}
     upload_versioned_parquet(
         connector=connector,
         location=folders["state_folder"],
@@ -263,6 +331,7 @@ def _flush_final_state(
         temp_dir=temp_dir,
         run_id=run_id,
     )
+    written_prefixes["state_folder"].add("manifest")
     upload_versioned_parquet(
         connector=connector,
         location=folders["state_folder"],
@@ -271,6 +340,7 @@ def _flush_final_state(
         temp_dir=temp_dir,
         run_id=run_id,
     )
+    written_prefixes["state_folder"].add("progress")
     upload_versioned_json(
         connector=connector,
         location=folders["state_folder"],
@@ -279,6 +349,8 @@ def _flush_final_state(
         temp_dir=temp_dir,
         run_id=run_id,
     )
+    written_prefixes["state_folder"].add("metadata")
+    return written_prefixes
 
 
 def execute_llm_step(data, step_config: dict, runtime_context: dict):
@@ -317,15 +389,21 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     progress_df = _load_existing_progress(dest_connector, folders["state_folder"], temp_dir)
     existing_results_df = _load_existing_results(dest_connector, folders["results_folder"], temp_dir)
     all_results_df = ensure_result_df(existing_results_df)
+    progress_df = _reconcile_progress_with_results(progress_df, all_results_df)
+    cumulative_permanent_review_df = _load_existing_debug_snapshot(
+        dest_connector,
+        folders["debug_folder"],
+        "permanent_review",
+        temp_dir,
+    )
 
-    completed_ids = success_unit_ids(progress_df)
+    completed_ids = _success_unit_ids_from_results(all_results_df)
     pending_units_df = work_units_df.filter(~pl.col("unit_id").is_in(list(completed_ids)))
-    permanent_review_unit_ids = _load_existing_permanent_review_unit_ids(dest_connector, folders["debug_folder"], temp_dir)
 
     print(
         (
             f"[llm:{step_config['name']}] start total_units={work_units_df.height} already_success={len(completed_ids)} "
-            f"pending_units={pending_units_df.height} existing_permanent_reviews={len(permanent_review_unit_ids)} initial_group_size={runtime['initial_group_size']} "
+            f"pending_units={pending_units_df.height} existing_permanent_reviews={cumulative_permanent_review_df.height} initial_group_size={runtime['initial_group_size']} "
             f"min_group_size={runtime['min_group_size']} max_group_size={runtime['max_group_size']} "
             f"flush_scope={runtime['flush_scope']} max_flushes_per_run={runtime['max_flushes_per_run']} "
             f"max_concurrent_requests={runtime['max_concurrent_requests']} workflow_folder={pipeline_name}"
@@ -336,15 +414,56 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     _upload_manifest(dest_connector, folders, temp_dir, work_units_df, run_id)
 
     if pending_units_df.is_empty():
+        released_row_ids = released_row_ids_for_flush(
+            work_units_df=work_units_df,
+            progress_df=progress_df,
+            flush_scope=runtime["flush_scope"],
+        )
+        partial_output_df = build_partial_output_df(
+            source_df=source_df,
+            all_results_df=all_results_df,
+            row_id_column=step_config["row_id_column"],
+            task_handler=task_handler,
+            step_config=step_config,
+            released_row_ids=released_row_ids,
+        )
+        pair_status_df = build_pair_status_df(
+            work_units_df=work_units_df,
+            progress_df=progress_df,
+            step_config=step_config,
+            released_row_ids=released_row_ids,
+        )
+        successful_unit_ids = _success_unit_ids_from_results(all_results_df)
+        if successful_unit_ids and cumulative_permanent_review_df is not None and not cumulative_permanent_review_df.is_empty():
+            cumulative_permanent_review_df = cumulative_permanent_review_df.filter(
+                ~pl.col("unit_id").is_in(list(successful_unit_ids))
+            )
         outcome = _progress_snapshot_outcome(
             work_units_df=work_units_df,
             progress_df=progress_df,
+            all_results_df=all_results_df,
             status="complete",
         )
-        metadata = build_runtime_metadata(step_config, work_units_df, progress_df, outcome)
+        metadata = build_runtime_metadata(step_config, work_units_df, progress_df, outcome, all_results_df=all_results_df)
         metadata["workflow_folder"] = pipeline_name
-        _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
-        cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
+        written_prefixes = _flush_incremental_state(
+            dest_connector,
+            folders,
+            temp_dir,
+            progress_df,
+            all_results_df,
+            [],
+            cumulative_permanent_review_df,
+            pair_status_df,
+            partial_output_df,
+            metadata,
+            runtime,
+            run_id,
+        )
+        final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
+        for folder_key, prefixes in final_written_prefixes.items():
+            written_prefixes.setdefault(folder_key, set()).update(prefixes)
+        cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False, new_artifact_prefixes=written_prefixes)
         print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
         return merge_results_back(
             source_df,
@@ -359,6 +478,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     def flush_callback(payload: dict):
         nonlocal progress_df
         nonlocal all_results_df
+        nonlocal cumulative_permanent_review_df
 
         new_progress_df = progress_rows_to_df(payload["progress_rows"])
         if not new_progress_df.is_empty():
@@ -388,26 +508,42 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             released_row_ids=released_row_ids,
         )
 
+        debug_df = debug_rows_to_df(payload["debug_rows"])
+        if not debug_df.is_empty():
+            permanent_from_flush = debug_df.filter(pl.col("status") == "permanent_error")
+            if not permanent_from_flush.is_empty():
+                cumulative_permanent_review_df = _merge_debug_latest(
+                    cumulative_permanent_review_df,
+                    permanent_from_flush,
+                )
+
+        successful_unit_ids = _success_unit_ids_from_results(all_results_df)
+        if successful_unit_ids and cumulative_permanent_review_df is not None and not cumulative_permanent_review_df.is_empty():
+            cumulative_permanent_review_df = cumulative_permanent_review_df.filter(
+                ~pl.col("unit_id").is_in(list(successful_unit_ids))
+            )
+
         running_outcome = _progress_snapshot_outcome(
             work_units_df=work_units_df,
             progress_df=progress_df,
+            all_results_df=all_results_df,
             status="running",
         )
-        metadata = build_runtime_metadata(step_config, work_units_df, progress_df, running_outcome)
+        metadata = build_runtime_metadata(step_config, work_units_df, progress_df, running_outcome, all_results_df=all_results_df)
         metadata["workflow_folder"] = pipeline_name
-        _flush_incremental_state(
+        written_prefixes = _flush_incremental_state(
             dest_connector,
             folders,
             temp_dir,
             progress_df,
-            payload["result_rows"],
+            all_results_df,
             payload["debug_rows"],
+            cumulative_permanent_review_df,
             pair_status_df,
             partial_output_df,
             metadata,
             runtime,
             run_id,
-            permanent_review_unit_ids,
         )
         if runtime.get("artifact_retention_mode", "standard") == "standard":
             cleanup_summary = cleanup_llm_artifacts(
@@ -415,6 +551,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
                 folders,
                 runtime,
                 include_final_outputs=False,
+                new_artifact_prefixes=written_prefixes,
             )
             print(
                 f"[llm:{step_config['name']}] cleanup_flush artifacts_deleted={cleanup_summary['artifacts']}",
@@ -454,25 +591,33 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         released_row_ids=released_row_ids,
     )
 
-    metadata = build_runtime_metadata(step_config, work_units_df, progress_df, batch_out["outcome"])
+    successful_unit_ids = _success_unit_ids_from_results(all_results_df)
+    if successful_unit_ids and cumulative_permanent_review_df is not None and not cumulative_permanent_review_df.is_empty():
+        cumulative_permanent_review_df = cumulative_permanent_review_df.filter(
+            ~pl.col("unit_id").is_in(list(successful_unit_ids))
+        )
+
+    metadata = build_runtime_metadata(step_config, work_units_df, progress_df, batch_out["outcome"], all_results_df=all_results_df)
     metadata["workflow_folder"] = pipeline_name
-    _flush_incremental_state(
+    written_prefixes = _flush_incremental_state(
         dest_connector,
         folders,
         temp_dir,
         progress_df,
+        all_results_df,
         [],
-        [],
+        cumulative_permanent_review_df,
         pair_status_df,
         partial_output_df,
         metadata,
         runtime,
         run_id,
-        permanent_review_unit_ids,
     )
-    _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
+    final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, progress_df, metadata, run_id)
+    for folder_key, prefixes in final_written_prefixes.items():
+        written_prefixes.setdefault(folder_key, set()).update(prefixes)
 
-    cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime)
+    cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False, new_artifact_prefixes=written_prefixes)
     print(f"[llm:{step_config['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
     final_merged = merge_results_back(

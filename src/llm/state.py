@@ -202,6 +202,7 @@ def cleanup_llm_artifacts(
     runtime: dict,
     include_final_outputs: bool = True,
     expected_final_output_prefixes: Optional[List[str]] = None,
+    new_artifact_prefixes: Optional[Dict[str, set[str]]] = None,
 ) -> Dict[str, int]:
     mode = runtime.get("artifact_retention_mode", "standard")
     deleted = {"final_outputs": 0, "artifacts": 0}
@@ -216,12 +217,16 @@ def cleanup_llm_artifacts(
 
     if mode == "standard":
         keep_last_n = int(runtime.get("keep_last_flushes", 3))
-        for folder_key, prefixes in {
+        prune_plan = {
             "state_folder": ["manifest", "progress", "metadata"],
             "results_folder": ["results", "partial_output", "results_snapshot"],
             "debug_folder": ["traces", "review", "pair_status", "permanent_review"],
-        }.items():
+        }
+        for folder_key, prefixes in prune_plan.items():
+            allowed_prefixes = None if new_artifact_prefixes is None else set(new_artifact_prefixes.get(folder_key, set()))
             for prefix in prefixes:
+                if allowed_prefixes is not None and prefix not in allowed_prefixes:
+                    continue
                 deleted["artifacts"] += _prune_keep_last_n_by_prefix(
                     connector=connector,
                     location=folders[folder_key],

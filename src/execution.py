@@ -118,7 +118,7 @@ def run_global_execution(
         artifact_runtime = merged_artifact_runtime_from_executable(executable)
         if artifact_runtime is not None:
             folders = ensure_llm_state_layout(dest_connector, workflow_location)
-            cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[_final_output_family_prefix(output_name)])
+            cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, include_final_outputs=True, expected_final_output_prefixes=[_final_output_family_prefix(output_name)])
             print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
     finally:
@@ -179,7 +179,7 @@ def run_batched_execution(
             artifact_runtime = merged_artifact_runtime_from_executable(executable)
             if artifact_runtime is not None:
                 folders = ensure_llm_state_layout(dest_connector, workflow_location)
-                cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, expected_final_output_prefixes=[f"{_final_output_family_prefix(output_name)}batch_"])
+                cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, include_final_outputs=True, expected_final_output_prefixes=[f"{output_name}_batch_"])
                 print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
 
         finally:

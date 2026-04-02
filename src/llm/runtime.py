@@ -277,7 +277,10 @@ def success_unit_ids(progress_df: pl.DataFrame) -> set:
 
 
 def success_or_terminal_unit_ids(progress_df: pl.DataFrame) -> set:
-    return success_unit_ids(progress_df)
+    if progress_df is None or progress_df.is_empty():
+        return set()
+    completed = progress_df.filter(pl.col("status").is_in(["success", "permanent_error"]))
+    return set(completed["unit_id"].to_list())
 
 
 def current_retry_count(progress_df: pl.DataFrame, unit_id: str) -> int:
@@ -295,18 +298,38 @@ def build_runtime_metadata(
     work_units_df: pl.DataFrame,
     progress_df: pl.DataFrame,
     outcome: LLMRunOutcome,
+    all_results_df: pl.DataFrame | None = None,
 ) -> dict:
-    completed_or_terminal = len(success_unit_ids(progress_df))
+    useful_completed = 0
+    if all_results_df is not None and not all_results_df.is_empty():
+        useful_completed = int(
+            all_results_df
+            .filter(pl.col("status") == "success")
+            .select(pl.col("unit_id").n_unique())
+            .item()
+        )
+    else:
+        useful_completed = len(success_unit_ids(progress_df))
+
+    terminal_count = len(success_or_terminal_unit_ids(progress_df))
+    permanent_error_count = 0 if progress_df is None or progress_df.is_empty() else int(
+        progress_df
+        .filter(pl.col("status") == "permanent_error")
+        .select(pl.col("unit_id").n_unique())
+        .item()
+    )
     return {
         "step_name": step_config["name"],
         "status": outcome.status,
         "processed_units_this_run": int(outcome.processed_units),
         "remaining_units": int(outcome.remaining_units),
         "total_units": int(work_units_df.height),
-        "completed_or_terminal_units": completed_or_terminal,
+        "completed_useful_units": useful_completed,
+        "completed_or_terminal_units": terminal_count,
+        "permanent_error_units": permanent_error_count,
         "updated_at": utc_now_iso(),
     }
 
 
-def build_run_metadata(step_config: dict, work_units_df: pl.DataFrame, progress_df: pl.DataFrame, outcome: LLMRunOutcome) -> dict:
-    return build_runtime_metadata(step_config, work_units_df, progress_df, outcome)
+def build_run_metadata(step_config: dict, work_units_df: pl.DataFrame, progress_df: pl.DataFrame, outcome: LLMRunOutcome, all_results_df: pl.DataFrame | None = None) -> dict:
+    return build_runtime_metadata(step_config, work_units_df, progress_df, outcome, all_results_df=all_results_df)
