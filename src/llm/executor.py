@@ -107,10 +107,8 @@ def _progress_snapshot_outcome(
 ) -> LLMRunOutcome:
     total_units = int(work_units_df.height)
     terminal_ids = success_or_terminal_unit_ids(progress_df)
-    remaining_units = max(total_units - len(terminal_ids), 0)
-
-    attempted_units = 0 if progress_df is None else int(progress_df.height)
-    processed_units = min(attempted_units, total_units)
+    processed_units = min(len(terminal_ids), total_units)
+    remaining_units = max(total_units - processed_units, 0)
 
     return LLMRunOutcome(
         status=status,

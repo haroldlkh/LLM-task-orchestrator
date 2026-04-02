@@ -131,6 +131,44 @@ def _terminal_units_from_statuses(progress_by_unit: dict) -> int:
     return sum(1 for status in statuses.values() if status in TERMINAL_STATUSES)
 
 
+
+
+
+
+def _apply_retry_limits(progress_rows, runtime: dict):
+    max_retries = int(runtime.get("max_request_retries", 0) or 0)
+    if max_retries < 0:
+        return progress_rows
+    adjusted = []
+    for row in progress_rows:
+        new_row = dict(row)
+        if new_row.get("status") == "retryable_error" and int(new_row.get("retry_count", 0) or 0) >= max_retries:
+            new_row["status"] = "permanent_error"
+            prior_error_type = new_row.get("last_error_type")
+            if prior_error_type:
+                new_row["last_error_type"] = f"{prior_error_type}|max_request_retries_exhausted"
+            else:
+                new_row["last_error_type"] = "max_request_retries_exhausted"
+            prior_error_message = new_row.get("last_error_message") or ""
+            if "max_request_retries" not in prior_error_message:
+                suffix = f" [engine converted to permanent_error after retry_count={int(new_row.get('retry_count', 0) or 0)} reached max_request_retries={max_retries}]"
+                new_row["last_error_message"] = f"{prior_error_message}{suffix}".strip()
+        adjusted.append(new_row)
+    return adjusted
+
+def _run_scope_status_counts(progress_by_unit: dict, run_unit_ids: set[str]) -> dict[str, int]:
+    counts = {"success": 0, "retryable_error": 0, "permanent_error": 0}
+    if not run_unit_ids:
+        return counts
+    for unit_id in run_unit_ids:
+        row = progress_by_unit.get(unit_id)
+        if not isinstance(row, dict):
+            continue
+        status = row.get("status")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
 def _seed_progress_map(progress_df) -> dict:
     if progress_df is None or progress_df.is_empty():
         return {}
@@ -305,7 +343,10 @@ def process_batches(
 ):
     pending_rows = [] if pending_rows is None else list(pending_rows)
     pending_queue = deque(pending_rows)
-    total_units = len({row["unit_id"] for row in pending_rows})
+    initial_pending_unit_ids = {row["unit_id"] for row in pending_rows}
+    initial_pending_units = len(initial_pending_unit_ids)
+    already_terminal_units = _terminal_units_from_statuses(_seed_progress_map(progress_df))
+    total_units = initial_pending_units + already_terminal_units
     soft_time_limit_seconds = runtime["soft_time_limit_minutes"] * 60
 
     pending_result_rows = []
@@ -313,6 +354,8 @@ def process_batches(
     pending_debug_rows = []
 
     progress_by_unit = _seed_progress_map(progress_df)
+    already_terminal_units = _terminal_units_from_statuses(progress_by_unit)
+    total_units = initial_pending_units + already_terminal_units
     attempted_dispatch_units = 0
     wave_index = 0
     groups_since_flush = 0
@@ -415,6 +458,9 @@ def process_batches(
                     ),
                     start_time=start_time,
                     remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
+                    run_total_units=initial_pending_units,
+                    run_status_counts=_run_scope_status_counts(progress_by_unit, initial_pending_unit_ids),
+                    queue_pending=len(pending_queue),
                 )
                 future = _dispatch_to_lane(executor, adapter, lane, group_units, request, estimated_tokens)
                 active[future] = {
@@ -511,6 +557,9 @@ def process_batches(
                     ),
                     start_time=start_time,
                     remaining_override=_remaining_units_from_statuses(progress_by_unit, total_units),
+                    run_total_units=initial_pending_units,
+                    run_status_counts=_run_scope_status_counts(progress_by_unit, initial_pending_unit_ids),
+                    queue_pending=len(pending_queue),
                 )
                 continue
 
@@ -556,6 +605,7 @@ def process_batches(
                         progress_df=progress_df,
                         request_attempt_count=int(request_result.get("request_attempt_count", 1) or 1),
                     )
+                    progress_rows = _apply_retry_limits(progress_rows, runtime)
                     pending_progress_rows.extend(progress_rows)
                     pending_debug_rows.extend(debug_rows)
                     merge_progress_rows_in_memory(progress_by_unit, progress_rows)
@@ -617,6 +667,7 @@ def process_batches(
                             progress_df=progress_df,
                             request_attempt_count=int(request_result.get("request_attempt_count", 1) or 1),
                         )
+                        progress_rows = _apply_retry_limits(progress_rows, runtime)
                         pending_progress_rows.extend(progress_rows)
                         pending_result_rows.extend(result_rows)
                         pending_debug_rows.extend(debug_rows)
@@ -679,6 +730,7 @@ def process_batches(
                             request_attempt_count=int(request_result.get("request_attempt_count", 1) or 1),
                             request_result=request_result,
                         )
+                        progress_rows = _apply_retry_limits(progress_rows, runtime)
                         pending_progress_rows.extend(progress_rows)
                         pending_debug_rows.extend(debug_rows)
                         merge_progress_rows_in_memory(progress_by_unit, progress_rows)
@@ -760,6 +812,7 @@ def process_batches(
             completed_flushes += 1
 
     remaining_units = _remaining_units_from_statuses(progress_by_unit, total_units)
+    run_counts = _run_scope_status_counts(progress_by_unit, initial_pending_unit_ids)
     outcome = LLMRunOutcome(
         status="complete" if remaining_units == 0 else "retryable_incomplete",
         processed_units=_terminal_units_from_statuses(progress_by_unit),
@@ -774,6 +827,11 @@ def process_batches(
             f"[llm:{step_config['name']}] event=run_end "
             f"processed={outcome.processed_units}/{total_units} "
             f"remaining={remaining_units} "
+            f"run_success={run_counts['success']} "
+            f"run_retryable_error={run_counts['retryable_error']} "
+            f"run_permanent_error={run_counts['permanent_error']} "
+            f"run_processed={run_counts['success'] + run_counts['permanent_error']}/{initial_pending_units} "
+            f"run_remaining={max(initial_pending_units - (run_counts['success'] + run_counts['permanent_error']), 0)} "
             f"outcome={outcome.status} "
             f"completed_flushes={completed_flushes} "
             f"total_wall_s={total_wall_seconds:.2f} "

@@ -64,10 +64,20 @@ def log_progress(
     note: str,
     start_time: float,
     remaining_override: int | None = None,
+    run_total_units: int | None = None,
+    run_status_counts: dict | None = None,
+    queue_pending: int | None = None,
 ) -> None:
     counts = status_counts_from_progress_map(progress_by_unit)
     elapsed = elapsed_seconds(start_time)
     remaining = remaining_override if remaining_override is not None else max(total_units - cursor, 0)
+    run_counts = run_status_counts or {}
+    run_total = int(run_total_units or 0)
+    run_success = int(run_counts.get("success", 0) or 0)
+    run_retryable = int(run_counts.get("retryable_error", 0) or 0)
+    run_permanent = int(run_counts.get("permanent_error", 0) or 0)
+    run_done = run_success + run_permanent
+    run_remaining = max(run_total - run_done, 0) if run_total > 0 else 0
 
     print(
         (
@@ -83,6 +93,12 @@ def log_progress(
             f"success={counts['success']} "
             f"retryable_error={counts['retryable_error']} "
             f"permanent_error={counts['permanent_error']} "
+            f"run_success={run_success} "
+            f"run_retryable_error={run_retryable} "
+            f"run_permanent_error={run_permanent} "
+            f"run_processed={run_done}/{run_total} "
+            f"run_remaining={run_remaining} "
+            f"queue_pending={int(queue_pending or 0)} "
             f"elapsed_s={elapsed} "
             f"note={note}"
         ),
