@@ -35,7 +35,7 @@ from .state import (
     upload_versioned_parquet,
     utc_now_run_id,
 )
-from .work_units import build_work_units
+from .work_units import build_manifest_df, build_work_units
 
 
 def _load_latest_parquet(connector, folder_id: str, prefix: str, temp_dir: str):
@@ -218,12 +218,12 @@ def _merge_debug_latest(base_debug_df: pl.DataFrame, new_debug_df: pl.DataFrame)
     return ensure_debug_df(latest)
 
 
-def _upload_manifest(connector, folders: dict, temp_dir: str, work_units_df: pl.DataFrame, run_id: str):
+def _upload_manifest(connector, folders: dict, temp_dir: str, manifest_df: pl.DataFrame, run_id: str):
     upload_versioned_parquet(
         connector=connector,
         location=folders["state_folder"],
         prefix="manifest",
-        df=work_units_df,
+        df=manifest_df,
         temp_dir=temp_dir,
         run_id=run_id,
     )
@@ -382,7 +382,7 @@ def _flush_final_state(
     connector,
     folders: dict,
     temp_dir: str,
-    work_units_df: pl.DataFrame,
+    manifest_df: pl.DataFrame,
     metadata: dict,
     run_id: str,
 ):
@@ -391,7 +391,7 @@ def _flush_final_state(
         connector=connector,
         location=folders["state_folder"],
         prefix="manifest",
-        df=work_units_df,
+        df=manifest_df,
         temp_dir=temp_dir,
         run_id=run_id,
     )
@@ -497,6 +497,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     )
 
     work_units_df = build_work_units(source_df, step_config)
+    manifest_df = build_manifest_df(work_units_df)
     progress_df = _load_existing_progress(dest_connector, folders["state_folder"], temp_dir)
     existing_results_df = _load_existing_results(dest_connector, folders["results_folder"], temp_dir)
     all_results_df = ensure_result_df(existing_results_df)
@@ -523,7 +524,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         flush=True,
     )
 
-    _upload_manifest(dest_connector, folders, temp_dir, work_units_df, run_id)
+    _upload_manifest(dest_connector, folders, temp_dir, manifest_df, run_id)
 
     if pending_units_df.is_empty():
         _, partial_output_df, pair_status_df = _build_materialized_views(
@@ -579,7 +580,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             run_id,
         )
         print(f"[llm:{step_config['name']}] flush_materialized_done reason=no_pending", flush=True)
-        final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, metadata, run_id)
+        final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, manifest_df, metadata, run_id)
         written_prefixes = _merge_written_prefixes(canonical_written, checkpoint_written, materialized_written, final_written_prefixes)
         cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False, new_artifact_prefixes=written_prefixes)
         print(f"[llm:{step_config['name']}] cleanup_done reason=run_end final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
@@ -766,7 +767,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         run_id,
     )
     print(f"[llm:{step_config['name']}] flush_materialized_done reason=run_end", flush=True)
-    final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, metadata, run_id)
+    final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, manifest_df, metadata, run_id)
     written_prefixes = _merge_written_prefixes(canonical_written, checkpoint_written, materialized_written, final_written_prefixes)
 
     print(f"[llm:{step_config['name']}] cleanup_start reason=run_end", flush=True)
