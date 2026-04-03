@@ -55,6 +55,18 @@ def download_latest_parquet_if_exists(
     prefix: str,
     temp_dir: str,
 ) -> Optional[pl.DataFrame]:
+    result = download_latest_parquet_with_meta_if_exists(connector, location, prefix, temp_dir)
+    if result is None:
+        return None
+    return result["df"]
+
+
+def download_latest_parquet_with_meta_if_exists(
+    connector,
+    location: str,
+    prefix: str,
+    temp_dir: str,
+) -> Optional[Dict]:
     objects = connector.list_objects(location)
     latest = latest_object_by_prefix(objects, prefix)
     if latest is None:
@@ -62,7 +74,7 @@ def download_latest_parquet_if_exists(
 
     local_path = os.path.join(temp_dir, latest["name"])
     connector.download_object(latest["id"], local_path)
-    return pl.read_parquet(local_path)
+    return {"df": pl.read_parquet(local_path), "object": latest}
 
 
 def download_all_parquet_by_prefix(
@@ -145,6 +157,8 @@ def _family_keep_count(runtime: dict, prefix: str) -> int:
         "progress": int(runtime.get("keep_last_progress", 2)),
         "metadata": int(runtime.get("keep_last_metadata", 2)),
         "results_snapshot": int(runtime.get("keep_last_results_snapshots", runtime.get("keep_last_flushes", 3))),
+        "results_checkpoint": int(runtime.get("keep_last_results_checkpoints", 2)),
+        "results_delta": int(runtime.get("keep_last_results_deltas", 1000)),
         "partial_output": int(runtime.get("keep_last_partial_outputs", 2)),
         "traces": int(runtime.get("keep_last_traces", 2)),
         "review": int(runtime.get("keep_last_reviews", 2)),
@@ -211,6 +225,21 @@ def _prune_debug_runs(connector, folders: Dict[str, str], keep_last_runs: int) -
     return deleted
 
 
+def _prune_results_deltas_covered_by_latest_checkpoint(connector, results_folder: str) -> int:
+    objects = connector.list_objects(results_folder)
+    latest_checkpoint = latest_object_by_prefix(objects, "results_checkpoint")
+    if latest_checkpoint is None:
+        return 0
+    deleted = 0
+    for obj in sorted(objects, key=lambda x: x["name"]):
+        if not obj["name"].startswith("results_delta"):
+            continue
+        if obj["name"] < latest_checkpoint["name"]:
+            connector.delete_object(obj["id"])
+            deleted += 1
+    return deleted
+
+
 def cleanup_llm_artifacts(
     connector,
     folders: Dict[str, str],
@@ -233,13 +262,16 @@ def cleanup_llm_artifacts(
     if mode == "standard":
         prune_plan = {
             "state_folder": ["manifest", "progress", "metadata"],
-            "results_folder": ["results", "partial_output", "results_snapshot"],
+            "results_folder": ["results", "partial_output", "results_snapshot", "results_checkpoint", "results_delta"],
             "debug_folder": ["traces", "review", "pair_status", "permanent_review"],
         }
         for folder_key, prefixes in prune_plan.items():
             allowed_prefixes = None if new_artifact_prefixes is None else set(new_artifact_prefixes.get(folder_key, set()))
             for prefix in prefixes:
                 if allowed_prefixes is not None and prefix not in allowed_prefixes:
+                    continue
+                if folder_key == "results_folder" and prefix == "results_delta" and allowed_prefixes is not None and "results_checkpoint" in allowed_prefixes:
+                    deleted["artifacts"] += _prune_results_deltas_covered_by_latest_checkpoint(connector, folders["results_folder"])
                     continue
                 deleted["artifacts"] += _prune_keep_last_n_by_prefix(
                     connector=connector,

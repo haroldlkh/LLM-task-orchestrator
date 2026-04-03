@@ -62,19 +62,51 @@ def _load_existing_progress(connector, state_folder: str, temp_dir: str) -> pl.D
 
 
 def _load_existing_results(connector, results_folder: str, temp_dir: str) -> pl.DataFrame:
-    snapshot_df = _load_latest_parquet(connector, results_folder, "results_snapshot_", temp_dir)
-    if snapshot_df is not None:
-        return ensure_result_df(snapshot_df)
+    objects = sorted(connector.list_objects(results_folder), key=lambda x: x["name"])
 
-    parts = []
-    for obj in connector.list_objects(results_folder):
-        if obj["name"].endswith(".parquet") and obj["name"].startswith("results_"):
-            local_path = f"{temp_dir}/{obj['name']}"
-            connector.download_object(obj["id"], local_path)
-            parts.append(pl.read_parquet(local_path))
-    if not parts:
-        return ensure_result_df(pl.DataFrame())
-    return ensure_result_df(pl.concat(parts, how="vertical_relaxed"))
+    checkpoint_obj = None
+    for obj in objects:
+        if obj["name"].endswith('.parquet') and obj["name"].startswith('results_checkpoint'):
+            checkpoint_obj = obj
+
+    checkpoint_df = None
+    checkpoint_name = None
+    if checkpoint_obj is not None:
+        checkpoint_name = checkpoint_obj['name']
+        local_path = f"{temp_dir}/{checkpoint_name}"
+        connector.download_object(checkpoint_obj['id'], local_path)
+        checkpoint_df = ensure_result_df(pl.read_parquet(local_path))
+
+    delta_parts = []
+    for obj in objects:
+        name = obj['name']
+        if not name.endswith('.parquet'):
+            continue
+        if name.startswith('results_delta') and (checkpoint_name is None or name > checkpoint_name):
+            local_path = f"{temp_dir}/{name}"
+            connector.download_object(obj['id'], local_path)
+            delta_parts.append(pl.read_parquet(local_path))
+
+    if checkpoint_df is None and not delta_parts:
+        legacy_snapshot_df = _load_latest_parquet(connector, results_folder, 'results_snapshot_', temp_dir)
+        if legacy_snapshot_df is not None:
+            return ensure_result_df(legacy_snapshot_df)
+
+        parts = []
+        for obj in objects:
+            name = obj['name']
+            if name.endswith('.parquet') and name.startswith('results_') and not name.startswith('results_delta') and not name.startswith('results_checkpoint'):
+                local_path = f"{temp_dir}/{name}"
+                connector.download_object(obj['id'], local_path)
+                parts.append(pl.read_parquet(local_path))
+        if not parts:
+            return ensure_result_df(pl.DataFrame())
+        return ensure_result_df(pl.concat(parts, how='vertical_relaxed'))
+
+    merged = checkpoint_df if checkpoint_df is not None else ensure_result_df(pl.DataFrame())
+    for delta_df in delta_parts:
+        merged = _merge_results(merged, ensure_result_df(delta_df))
+    return ensure_result_df(merged)
 
 
 def _load_existing_debug_snapshot(connector, debug_folder: str, prefix: str, temp_dir: str) -> pl.DataFrame:
@@ -202,7 +234,7 @@ def _flush_canonical_state(
     folders: dict,
     temp_dir: str,
     progress_df: pl.DataFrame,
-    all_results_df: pl.DataFrame,
+    new_results_df: pl.DataFrame,
     debug_rows,
     cumulative_permanent_review_df: pl.DataFrame,
     metadata: dict,
@@ -224,15 +256,16 @@ def _flush_canonical_state(
     )
     written_prefixes["state_folder"].add("progress")
 
-    upload_versioned_parquet(
-        connector=connector,
-        location=folders["results_folder"],
-        prefix="results_snapshot",
-        df=ensure_result_df(all_results_df),
-        temp_dir=temp_dir,
-        run_id=run_id,
-    )
-    written_prefixes["results_folder"].add("results_snapshot")
+    if new_results_df is not None and not new_results_df.is_empty():
+        upload_versioned_parquet(
+            connector=connector,
+            location=folders["results_folder"],
+            prefix="results_delta",
+            df=ensure_result_df(new_results_df),
+            temp_dir=temp_dir,
+            run_id=run_id,
+        )
+        written_prefixes["results_folder"].add("results_delta")
 
     if debug_rows:
         debug_df = debug_rows_to_df(debug_rows)
@@ -278,6 +311,30 @@ def _flush_canonical_state(
         run_id=run_id,
     )
     written_prefixes["state_folder"].add("metadata")
+    return written_prefixes
+
+
+def _flush_results_checkpoint(
+    connector,
+    folders: dict,
+    temp_dir: str,
+    all_results_df: pl.DataFrame,
+    run_id: str,
+):
+    written_prefixes: dict[str, set[str]] = {
+        "state_folder": set(),
+        "results_folder": set(),
+        "debug_folder": set(),
+    }
+    upload_versioned_parquet(
+        connector=connector,
+        location=folders["results_folder"],
+        prefix="results_checkpoint",
+        df=ensure_result_df(all_results_df),
+        temp_dir=temp_dir,
+        run_id=run_id,
+    )
+    written_prefixes["results_folder"].add("results_checkpoint")
     return written_prefixes
 
 
@@ -395,6 +452,18 @@ def _should_materialize(flush_count: int, last_materialize_at: float | None, run
         return False
     return (time.time() - last_materialize_at) >= float(runtime.get("materialize_every_n_seconds", 60))
 
+
+def _should_checkpoint(flush_count: int, last_checkpoint_at: float | None, runtime: dict, force: bool = False) -> bool:
+    if force:
+        return True
+    if flush_count <= 0:
+        return False
+    if flush_count % int(runtime.get("checkpoint_every_n_flushes", 10)) == 0:
+        return True
+    if last_checkpoint_at is None:
+        return False
+    return (time.time() - last_checkpoint_at) >= float(runtime.get("checkpoint_every_n_seconds", 300))
+
 def execute_llm_step(data, step_config: dict, runtime_context: dict):
     validate_llm_step(step_config)
     source_df = data.collect(streaming=True) if isinstance(data, pl.LazyFrame) else data
@@ -485,10 +554,17 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             folders,
             temp_dir,
             progress_df,
-            all_results_df,
+            ensure_result_df(pl.DataFrame()),
             [],
             cumulative_permanent_review_df,
             metadata,
+            run_id,
+        )
+        checkpoint_written = _flush_results_checkpoint(
+            dest_connector,
+            folders,
+            temp_dir,
+            all_results_df,
             run_id,
         )
         print(f"[llm:{step_config['name']}] flush_canonical_done reason=no_pending", flush=True)
@@ -504,7 +580,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
         print(f"[llm:{step_config['name']}] flush_materialized_done reason=no_pending", flush=True)
         final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, metadata, run_id)
-        written_prefixes = _merge_written_prefixes(canonical_written, materialized_written, final_written_prefixes)
+        written_prefixes = _merge_written_prefixes(canonical_written, checkpoint_written, materialized_written, final_written_prefixes)
         cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False, new_artifact_prefixes=written_prefixes)
         print(f"[llm:{step_config['name']}] cleanup_done reason=run_end final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
         return merge_results_back(
@@ -518,10 +594,12 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     start_time = time.time()
     flush_count = 0
     last_materialize_at = time.time()
+    last_checkpoint_at = time.time()
 
     def flush_callback(payload: dict):
         nonlocal flush_count
         nonlocal last_materialize_at
+        nonlocal last_checkpoint_at
         nonlocal progress_df
         nonlocal all_results_df
         nonlocal cumulative_permanent_review_df
@@ -565,7 +643,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             folders,
             temp_dir,
             progress_df,
-            all_results_df,
+            new_results_df,
             payload["debug_rows"],
             cumulative_permanent_review_df,
             metadata,
@@ -574,6 +652,18 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         print(f"[llm:{step_config['name']}] flush_canonical_done flush_count={flush_count}", flush=True)
 
         written_prefixes = canonical_written
+        if _should_checkpoint(flush_count, last_checkpoint_at, runtime):
+            print(f"[llm:{step_config['name']}] flush_checkpoint_start flush_count={flush_count}", flush=True)
+            checkpoint_written = _flush_results_checkpoint(
+                dest_connector,
+                folders,
+                temp_dir,
+                all_results_df,
+                run_id,
+            )
+            last_checkpoint_at = time.time()
+            print(f"[llm:{step_config['name']}] flush_checkpoint_done flush_count={flush_count}", flush=True)
+            written_prefixes = _merge_written_prefixes(written_prefixes, checkpoint_written)
         if _should_materialize(flush_count, last_materialize_at, runtime):
             print(f"[llm:{step_config['name']}] flush_materialized_start flush_count={flush_count}", flush=True)
             _, partial_output_df, pair_status_df = _build_materialized_views(
@@ -649,13 +739,22 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         folders,
         temp_dir,
         progress_df,
-        all_results_df,
+        ensure_result_df(pl.DataFrame()),
         [],
         cumulative_permanent_review_df,
         metadata,
         run_id,
     )
     print(f"[llm:{step_config['name']}] flush_canonical_done reason=run_end", flush=True)
+    print(f"[llm:{step_config['name']}] flush_checkpoint_start reason=run_end", flush=True)
+    checkpoint_written = _flush_results_checkpoint(
+        dest_connector,
+        folders,
+        temp_dir,
+        all_results_df,
+        run_id,
+    )
+    print(f"[llm:{step_config['name']}] flush_checkpoint_done reason=run_end", flush=True)
     print(f"[llm:{step_config['name']}] flush_materialized_start reason=run_end", flush=True)
     materialized_written = _flush_materialized_views(
         dest_connector,
@@ -668,7 +767,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     )
     print(f"[llm:{step_config['name']}] flush_materialized_done reason=run_end", flush=True)
     final_written_prefixes = _flush_final_state(dest_connector, folders, temp_dir, work_units_df, metadata, run_id)
-    written_prefixes = _merge_written_prefixes(canonical_written, materialized_written, final_written_prefixes)
+    written_prefixes = _merge_written_prefixes(canonical_written, checkpoint_written, materialized_written, final_written_prefixes)
 
     print(f"[llm:{step_config['name']}] cleanup_start reason=run_end", flush=True)
     cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, runtime, include_final_outputs=False, new_artifact_prefixes=written_prefixes)
