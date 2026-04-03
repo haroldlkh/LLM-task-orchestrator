@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 from loader_factory import get_loader
 from llm.artifact_retention import merged_artifact_runtime_from_executable
 from llm.executor import execute_llm_step
-from llm.state import cleanup_llm_artifacts, ensure_llm_state_layout, sanitize_name
+from llm.state import ensure_llm_state_layout, prune_final_outputs_only, sanitize_name
 
 
 def _final_output_family_prefix(output_name: str) -> str:
@@ -117,9 +117,13 @@ def run_global_execution(
         save_final_output(loader, result, workflow_location, dest_connector, output_name)
         artifact_runtime = merged_artifact_runtime_from_executable(executable)
         if artifact_runtime is not None:
-            folders = ensure_llm_state_layout(dest_connector, workflow_location)
-            cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, include_final_outputs=True, expected_final_output_prefixes=[_final_output_family_prefix(output_name)])
-            print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
+            final_outputs_deleted = prune_final_outputs_only(
+                connector=dest_connector,
+                workflow_location=workflow_location,
+                keep_last_n=int(artifact_runtime.get("keep_last_final_outputs", 3)),
+                expected_prefixes=[_final_output_family_prefix(output_name)],
+            )
+            print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={final_outputs_deleted} artifacts_deleted=0", flush=True)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -178,9 +182,13 @@ def run_batched_execution(
             save_final_output(loader, result, workflow_location, dest_connector, batch_output_name)
             artifact_runtime = merged_artifact_runtime_from_executable(executable)
             if artifact_runtime is not None:
-                folders = ensure_llm_state_layout(dest_connector, workflow_location)
-                cleanup_summary = cleanup_llm_artifacts(dest_connector, folders, artifact_runtime, include_final_outputs=True, expected_final_output_prefixes=[f"{output_name}_batch_"])
-                print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={cleanup_summary['final_outputs']} artifacts_deleted={cleanup_summary['artifacts']}", flush=True)
+                final_outputs_deleted = prune_final_outputs_only(
+                    connector=dest_connector,
+                    workflow_location=workflow_location,
+                    keep_last_n=int(artifact_runtime.get("keep_last_final_outputs", 3)),
+                    expected_prefixes=[f"{output_name}_batch_"],
+                )
+                print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={final_outputs_deleted} artifacts_deleted=0", flush=True)
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)

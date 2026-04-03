@@ -7,6 +7,38 @@ from typing import Dict, List, Optional
 import polars as pl
 
 
+ARTIFACT_FAMILIES = [
+    "results_checkpoint",
+    "results_delta",
+    "results_snapshot",
+    "partial_output",
+    "pair_status",
+    "permanent_review",
+    "manifest",
+    "progress",
+    "metadata",
+    "traces",
+    "review",
+    "results",
+]
+
+
+def _matches_artifact_family(name: str, family: str) -> bool:
+    if not name.startswith(family):
+        return False
+    if len(name) == len(family):
+        return True
+    remainder = name[len(family):]
+    return remainder.startswith("_") or remainder.startswith("__") or remainder.startswith(".")
+
+
+def _artifact_family_from_name(name: str) -> str | None:
+    for family in sorted(ARTIFACT_FAMILIES, key=len, reverse=True):
+        if _matches_artifact_family(name, family):
+            return family
+    return None
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -42,7 +74,7 @@ def ensure_llm_state_layout(
 
 
 def latest_object_by_prefix(objects: List[Dict], prefix: str) -> Optional[Dict]:
-    matches = [obj for obj in objects if obj["name"].startswith(prefix)]
+    matches = [obj for obj in objects if _matches_artifact_family(obj["name"], prefix)]
     if not matches:
         return None
     matches.sort(key=lambda x: x["name"])
@@ -84,7 +116,7 @@ def download_all_parquet_by_prefix(
     temp_dir: str,
 ) -> List[pl.DataFrame]:
     objects = connector.list_objects(location)
-    matches = [obj for obj in objects if obj["name"].startswith(prefix)]
+    matches = [obj for obj in objects if _matches_artifact_family(obj["name"], prefix)]
     matches.sort(key=lambda x: x["name"])
 
     dfs = []
@@ -143,7 +175,7 @@ def _run_id_from_name(name: str) -> str | None:
 
 
 def _prune_keep_last_n_by_prefix(connector, location: str, prefix: str, keep_last_n: int) -> int:
-    objects = [obj for obj in connector.list_objects(location) if obj["name"].startswith(prefix)]
+    objects = [obj for obj in connector.list_objects(location) if _matches_artifact_family(obj["name"], prefix)]
     objects.sort(key=lambda x: x["name"])
     to_delete = objects[:-keep_last_n] if len(objects) > keep_last_n else []
     for obj in to_delete:
@@ -152,20 +184,21 @@ def _prune_keep_last_n_by_prefix(connector, location: str, prefix: str, keep_las
 
 
 def _family_keep_count(runtime: dict, prefix: str) -> int:
+    default_keep = int(runtime.get("keep_last_flushes", 3))
     family_keep_counts = {
-        "manifest": int(runtime.get("keep_last_manifests", runtime.get("keep_last_flushes", 3))),
-        "progress": int(runtime.get("keep_last_progress", 2)),
-        "metadata": int(runtime.get("keep_last_metadata", 2)),
-        "results_snapshot": int(runtime.get("keep_last_results_snapshots", runtime.get("keep_last_flushes", 3))),
-        "results_checkpoint": int(runtime.get("keep_last_results_checkpoints", 2)),
-        "results_delta": int(runtime.get("keep_last_results_deltas", 1000)),
-        "partial_output": int(runtime.get("keep_last_partial_outputs", 2)),
-        "traces": int(runtime.get("keep_last_traces", 2)),
-        "review": int(runtime.get("keep_last_reviews", 2)),
-        "pair_status": int(runtime.get("keep_last_pair_status", 2)),
-        "permanent_review": int(runtime.get("keep_last_permanent_reviews", 2)),
+        "manifest": int(runtime.get("keep_last_manifests", default_keep)),
+        "progress": int(runtime.get("keep_last_progress", default_keep)),
+        "metadata": int(runtime.get("keep_last_metadata", default_keep)),
+        "results_snapshot": int(runtime.get("keep_last_results_snapshots", default_keep)),
+        "results_checkpoint": int(runtime.get("keep_last_results_checkpoints", default_keep)),
+        "results_delta": int(runtime.get("keep_last_results_deltas", default_keep)),
+        "partial_output": int(runtime.get("keep_last_partial_outputs", default_keep)),
+        "traces": int(runtime.get("keep_last_traces", default_keep)),
+        "review": int(runtime.get("keep_last_reviews", default_keep)),
+        "pair_status": int(runtime.get("keep_last_pair_status", default_keep)),
+        "permanent_review": int(runtime.get("keep_last_permanent_reviews", default_keep)),
     }
-    return family_keep_counts.get(prefix, int(runtime.get("keep_last_flushes", 3)))
+    return family_keep_counts.get(prefix, default_keep)
 
 
 def _prune_final_outputs(
@@ -178,7 +211,7 @@ def _prune_final_outputs(
     if expected_prefixes:
         objects = [
             obj for obj in objects
-            if any(obj["name"].startswith(prefix) for prefix in expected_prefixes)
+            if any(_matches_artifact_family(obj["name"], prefix) for prefix in expected_prefixes)
         ]
     objects.sort(key=lambda x: x["name"])
     to_delete = objects[:-keep_last_n] if len(objects) > keep_last_n else []
@@ -190,7 +223,7 @@ def _prune_final_outputs(
 def _group_objects_by_run_id(objects: List[Dict], prefixes: List[str]) -> Dict[str, List[Dict]]:
     grouped: Dict[str, List[Dict]] = {}
     for obj in objects:
-        if not any(obj["name"].startswith(prefix) for prefix in prefixes):
+        if _artifact_family_from_name(obj["name"]) not in set(prefixes):
             continue
         run_id = _run_id_from_name(obj["name"])
         if run_id is None:
@@ -225,20 +258,40 @@ def _prune_debug_runs(connector, folders: Dict[str, str], keep_last_runs: int) -
     return deleted
 
 
-def _prune_results_deltas_covered_by_latest_checkpoint(connector, results_folder: str) -> int:
-    objects = connector.list_objects(results_folder)
-    latest_checkpoint = latest_object_by_prefix(objects, "results_checkpoint")
-    if latest_checkpoint is None:
+def _prune_results_deltas_by_kept_checkpoint_sets(connector, results_folder: str, keep_checkpoint_sets: int) -> int:
+    objects = sorted(connector.list_objects(results_folder), key=lambda x: x["name"])
+    checkpoints = [obj for obj in objects if _matches_artifact_family(obj["name"], "results_checkpoint")]
+    deltas = [obj for obj in objects if _matches_artifact_family(obj["name"], "results_delta")]
+    if not deltas:
         return 0
+    if not checkpoints:
+        keep_last_n = max(int(keep_checkpoint_sets), 1)
+        to_delete = deltas[:-keep_last_n] if len(deltas) > keep_last_n else []
+        for obj in to_delete:
+            connector.delete_object(obj["id"])
+        return len(to_delete)
+
+    keep_checkpoint_sets = max(int(keep_checkpoint_sets), 1)
+    kept_checkpoints = checkpoints[-keep_checkpoint_sets:] if len(checkpoints) > keep_checkpoint_sets else checkpoints
+    oldest_kept_checkpoint_name = kept_checkpoints[0]["name"]
+
     deleted = 0
-    for obj in sorted(objects, key=lambda x: x["name"]):
-        if not obj["name"].startswith("results_delta"):
-            continue
-        if obj["name"] < latest_checkpoint["name"]:
+    for obj in deltas:
+        if obj["name"] < oldest_kept_checkpoint_name:
             connector.delete_object(obj["id"])
             deleted += 1
     return deleted
 
+
+
+
+def prune_final_outputs_only(connector, workflow_location: str, keep_last_n: int, expected_prefixes: Optional[List[str]] = None) -> int:
+    return _prune_final_outputs(
+        connector=connector,
+        workflow_location=workflow_location,
+        keep_last_n=keep_last_n,
+        expected_prefixes=expected_prefixes,
+    )
 
 def cleanup_llm_artifacts(
     connector,
@@ -270,8 +323,12 @@ def cleanup_llm_artifacts(
             for prefix in prefixes:
                 if allowed_prefixes is not None and prefix not in allowed_prefixes:
                     continue
-                if folder_key == "results_folder" and prefix == "results_delta" and allowed_prefixes is not None and "results_checkpoint" in allowed_prefixes:
-                    deleted["artifacts"] += _prune_results_deltas_covered_by_latest_checkpoint(connector, folders["results_folder"])
+                if folder_key == "results_folder" and prefix == "results_delta":
+                    deleted["artifacts"] += _prune_results_deltas_by_kept_checkpoint_sets(
+                        connector,
+                        folders["results_folder"],
+                        keep_checkpoint_sets=_family_keep_count(runtime, "results_delta"),
+                    )
                     continue
                 deleted["artifacts"] += _prune_keep_last_n_by_prefix(
                     connector=connector,
