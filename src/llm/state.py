@@ -207,11 +207,17 @@ def _prune_final_outputs(
     keep_last_n: int,
     expected_prefixes: Optional[List[str]] = None,
 ) -> int:
+    """Prune workflow-level final outputs by filename prefix.
+
+    Final outputs are not artifact families like state/debug/result artifacts; they are
+    timestamped workflow result files such as ``perspective_taking_llm_20260403_023709.parquet``.
+    Those names should be matched by plain filename prefix, not artifact-family boundary logic.
+    """
     objects = [obj for obj in connector.list_objects(workflow_location) if obj["name"].endswith('.parquet')]
     if expected_prefixes:
         objects = [
             obj for obj in objects
-            if any(_matches_artifact_family(obj["name"], prefix) for prefix in expected_prefixes)
+            if any(obj["name"].startswith(prefix) for prefix in expected_prefixes)
         ]
     objects.sort(key=lambda x: x["name"])
     to_delete = objects[:-keep_last_n] if len(objects) > keep_last_n else []

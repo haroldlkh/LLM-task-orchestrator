@@ -228,6 +228,7 @@ def _upload_manifest(connector, folders: dict, temp_dir: str, manifest_df: pl.Da
         temp_dir=temp_dir,
         run_id=run_id,
     )
+    return {"state_folder": {"manifest"}, "results_folder": set(), "debug_folder": set()}
 
 
 def _flush_canonical_state(
@@ -515,7 +516,15 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         flush=True,
     )
 
-    _upload_manifest(dest_connector, folders, temp_dir, manifest_df, run_id)
+    manifest_written = _upload_manifest(dest_connector, folders, temp_dir, manifest_df, run_id)
+    if runtime.get("artifact_retention_mode", "standard") == "standard":
+        cleanup_llm_artifacts(
+            dest_connector,
+            folders,
+            runtime,
+            include_final_outputs=False,
+            new_artifact_prefixes=manifest_written,
+        )
 
     if pending_units_df.is_empty():
         _, partial_output_df, pair_status_df = _build_materialized_views(
