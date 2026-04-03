@@ -586,9 +586,9 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     flush_count = 0
     last_materialize_at = time.time()
     last_checkpoint_at = time.time()
-    state_dirty_since_flush = False
-    materialized_dirty_since_flush = False
-    checkpoint_dirty_since_flush = False
+    change_generation = 0
+    last_canonical_flushed_generation = 0
+    last_materialized_flushed_generation = 0
 
     def flush_callback(payload: dict):
         nonlocal flush_count
@@ -597,9 +597,9 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         nonlocal progress_df
         nonlocal all_results_df
         nonlocal cumulative_permanent_review_df
-        nonlocal state_dirty_since_flush
-        nonlocal materialized_dirty_since_flush
-        nonlocal checkpoint_dirty_since_flush
+        nonlocal change_generation
+        nonlocal last_canonical_flushed_generation
+        nonlocal last_materialized_flushed_generation
 
         new_progress_df = progress_rows_to_df(payload["progress_rows"])
         if not new_progress_df.is_empty():
@@ -631,10 +631,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             or bool(payload["debug_rows"])
         )
         if payload_has_changes:
-            state_dirty_since_flush = True
-            materialized_dirty_since_flush = True
-            if new_results_df is not None and not new_results_df.is_empty():
-                checkpoint_dirty_since_flush = True
+            change_generation += 1
 
         flush_count += 1
         running_outcome = _progress_snapshot_outcome(
@@ -658,7 +655,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             run_id,
         )
         print(f"[llm:{step_config['name']}] flush_canonical_done flush_count={flush_count}", flush=True)
-        state_dirty_since_flush = False
+        last_canonical_flushed_generation = change_generation
 
         written_prefixes = canonical_written
         if _should_checkpoint(flush_count, last_checkpoint_at, runtime):
@@ -671,7 +668,6 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
                 run_id,
             )
             last_checkpoint_at = time.time()
-            checkpoint_dirty_since_flush = False
             print(f"[llm:{step_config['name']}] flush_checkpoint_done flush_count={flush_count}", flush=True)
             written_prefixes = _merge_written_prefixes(written_prefixes, checkpoint_written)
         if _should_materialize(flush_count, last_materialize_at, runtime):
@@ -695,7 +691,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
                 run_id,
             )
             last_materialize_at = time.time()
-            materialized_dirty_since_flush = False
+            last_materialized_flushed_generation = change_generation
             print(f"[llm:{step_config['name']}] flush_materialized_done flush_count={flush_count}", flush=True)
             written_prefixes = _merge_written_prefixes(written_prefixes, materialized_written)
 
@@ -745,7 +741,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     metadata = build_runtime_metadata(step_config, work_units_df, progress_df, batch_out["outcome"], all_results_df=all_results_df)
     metadata["workflow_folder"] = pipeline_name
 
-    if state_dirty_since_flush:
+    if change_generation > last_canonical_flushed_generation:
         print(f"[llm:{step_config['name']}] flush_canonical_start reason=run_end", flush=True)
         _flush_canonical_state(
             dest_connector,
@@ -758,24 +754,20 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             metadata,
             run_id,
         )
+        last_canonical_flushed_generation = change_generation
         print(f"[llm:{step_config['name']}] flush_canonical_done reason=run_end", flush=True)
-    else:
-        print(f"[llm:{step_config['name']}] flush_canonical_skip reason=run_end clean_state=true", flush=True)
 
-    if checkpoint_dirty_since_flush:
-        print(f"[llm:{step_config['name']}] flush_checkpoint_start reason=run_end", flush=True)
-        _flush_results_checkpoint(
-            dest_connector,
-            folders,
-            temp_dir,
-            all_results_df,
-            run_id,
-        )
-        print(f"[llm:{step_config['name']}] flush_checkpoint_done reason=run_end", flush=True)
-    else:
-        print(f"[llm:{step_config['name']}] flush_checkpoint_skip reason=run_end clean_state=true", flush=True)
+    print(f"[llm:{step_config['name']}] flush_checkpoint_start reason=run_end", flush=True)
+    _flush_results_checkpoint(
+        dest_connector,
+        folders,
+        temp_dir,
+        all_results_df,
+        run_id,
+    )
+    print(f"[llm:{step_config['name']}] flush_checkpoint_done reason=run_end", flush=True)
 
-    if materialized_dirty_since_flush:
+    if change_generation > last_materialized_flushed_generation:
         print(f"[llm:{step_config['name']}] flush_materialized_start reason=run_end", flush=True)
         _flush_materialized_views(
             dest_connector,
@@ -786,9 +778,8 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
             runtime,
             run_id,
         )
+        last_materialized_flushed_generation = change_generation
         print(f"[llm:{step_config['name']}] flush_materialized_done reason=run_end", flush=True)
-    else:
-        print(f"[llm:{step_config['name']}] flush_materialized_skip reason=run_end clean_state=true", flush=True)
 
     print(f"[llm:{step_config['name']}] flush_metadata_start reason=run_end", flush=True)
     _flush_terminal_metadata(dest_connector, folders, temp_dir, metadata, run_id)

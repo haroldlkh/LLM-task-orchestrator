@@ -123,7 +123,8 @@ def run_global_execution(
                 keep_last_n=int(artifact_runtime.get("keep_last_final_outputs", 3)),
                 expected_prefixes=[_final_output_family_prefix(output_name)],
             )
-            print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={final_outputs_deleted} artifacts_deleted=0", flush=True)
+            if final_outputs_deleted > 0:
+                print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={final_outputs_deleted}", flush=True)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -188,7 +189,8 @@ def run_batched_execution(
                     keep_last_n=int(artifact_runtime.get("keep_last_final_outputs", 3)),
                     expected_prefixes=[f"{output_name}_batch_"],
                 )
-                print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={final_outputs_deleted} artifacts_deleted=0", flush=True)
+                if final_outputs_deleted > 0:
+                    print(f"[workflow:{executable['name']}] cleanup final_outputs_deleted={final_outputs_deleted}", flush=True)
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
