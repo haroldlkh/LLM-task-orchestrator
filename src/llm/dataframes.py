@@ -27,6 +27,14 @@ RESULT_SCHEMA: Dict[str, pl.DataType] = {
     "review_reason": pl.Utf8,
 }
 
+CHECKPOINT_RESULT_SCHEMA: Dict[str, pl.DataType] = {
+    "unit_id": pl.Utf8,
+    "row_id": pl.Utf8,
+    "output_column": pl.Utf8,
+    "status": pl.Utf8,
+    "output_value": pl.Utf8,
+}
+
 DEBUG_SCHEMA: Dict[str, pl.DataType] = {
     "unit_id": pl.Utf8,
     "row_id": pl.Utf8,
@@ -160,6 +168,12 @@ def ensure_progress_df(df: pl.DataFrame) -> pl.DataFrame:
 
 def ensure_result_df(df: pl.DataFrame) -> pl.DataFrame:
     return ensure_df_schema(df, RESULT_SCHEMA)
+
+
+def checkpoint_result_df(df: pl.DataFrame) -> pl.DataFrame:
+    working = ensure_result_df(df)
+    success_only = working.filter(pl.col("status") == "success")
+    return ensure_df_schema(success_only.select(list(CHECKPOINT_RESULT_SCHEMA.keys())), CHECKPOINT_RESULT_SCHEMA)
 
 
 def ensure_debug_df(df: pl.DataFrame) -> pl.DataFrame:

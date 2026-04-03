@@ -10,6 +10,7 @@ from .batch_flush import (
 )
 from .batch_processor import process_batches
 from .dataframes import (
+    checkpoint_result_df,
     debug_rows_to_df,
     ensure_debug_df,
     ensure_progress_df,
@@ -330,7 +331,7 @@ def _flush_results_checkpoint(
         connector=connector,
         location=folders["results_folder"],
         prefix="results_checkpoint",
-        df=ensure_result_df(all_results_df),
+        df=checkpoint_result_df(all_results_df),
         temp_dir=temp_dir,
         run_id=run_id,
     )
