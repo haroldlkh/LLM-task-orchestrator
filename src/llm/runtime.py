@@ -104,6 +104,25 @@ def default_runtime(step_config: dict) -> dict:
         "keep_last_final_outputs": int(runtime.get("keep_last_final_outputs", 3)),
         "keep_last_runs": int(runtime.get("keep_last_runs", 10)),
         "keep_all_flushes_within_kept_runs": bool(runtime.get("keep_all_flushes_within_kept_runs", True)),
+        "bandits_enabled": bool(runtime.get("bandits_enabled", True)),
+        "payload_bandit_policy": runtime.get("payload_bandit_policy", "ucb"),
+        "payload_bandit_ucb_c": float(runtime.get("payload_bandit_ucb_c", 1.2)),
+        "lane_bandit_policy": runtime.get("lane_bandit_policy", "ucb"),
+        "lane_bandit_ucb_c": float(runtime.get("lane_bandit_ucb_c", 1.2)),
+        "bandit_state_mode": runtime.get("bandit_state_mode", "run_local"),
+        "bandit_state_ttl_hours": int(runtime.get("bandit_state_ttl_hours", 24)),
+        "bandit_state_decay": float(runtime.get("bandit_state_decay", 0.85)),
+        "payload_arm_targets": list(runtime.get("payload_arm_targets", [8000, 16000, 24000, 32000])),
+        "lane_max_in_flight_per_key": int(runtime.get("lane_max_in_flight_per_key", 2)),
+        "max_total_in_flight_requests": int(runtime.get("max_total_in_flight_requests", max(1, max_concurrent_requests))),
+        "provider_group_cooldown_multiplier": float(runtime.get("provider_group_cooldown_multiplier", 1.5)),
+        "provider_group_throttle_threshold": int(runtime.get("provider_group_throttle_threshold", 2)),
+        "payload_reward_unusable_penalty": float(runtime.get("payload_reward_unusable_penalty", 2.0)),
+        "payload_reward_timeout_penalty": float(runtime.get("payload_reward_timeout_penalty", 4.0)),
+        "payload_reward_retryable_penalty": float(runtime.get("payload_reward_retryable_penalty", 1.0)),
+        "lane_reward_transport_penalty": float(runtime.get("lane_reward_transport_penalty", 3.0)),
+        "lane_reward_throttle_penalty": float(runtime.get("lane_reward_throttle_penalty", 4.0)),
+        "lane_reward_retryable_penalty": float(runtime.get("lane_reward_retryable_penalty", 1.0)),
     }
     merged.update({key: runtime.get(key, default) for key, default in TPM_RUNTIME_DEFAULTS.items()})
     return merged
@@ -278,6 +297,31 @@ def validate_llm_step(step_config: dict):
         raise ValueError("LLM runtime 'keep_last_final_outputs' must be >= 1")
     if runtime["keep_last_runs"] < 1:
         raise ValueError("LLM runtime 'keep_last_runs' must be >= 1")
+
+    if runtime["bandit_state_mode"] not in {"off", "run_local", "cross_run"}:
+        raise ValueError("LLM runtime 'bandit_state_mode' must be one of {'off', 'run_local', 'cross_run'}")
+    if runtime["payload_bandit_policy"] not in {"ucb"}:
+        raise ValueError("LLM runtime 'payload_bandit_policy' must be 'ucb'")
+    if runtime["lane_bandit_policy"] not in {"ucb"}:
+        raise ValueError("LLM runtime 'lane_bandit_policy' must be 'ucb'")
+    if runtime["payload_bandit_ucb_c"] < 0 or runtime["lane_bandit_ucb_c"] < 0:
+        raise ValueError("Bandit exploration constants must be >= 0")
+    if runtime["bandit_state_ttl_hours"] < 1:
+        raise ValueError("LLM runtime 'bandit_state_ttl_hours' must be >= 1")
+    if runtime["bandit_state_decay"] <= 0 or runtime["bandit_state_decay"] > 1:
+        raise ValueError("LLM runtime 'bandit_state_decay' must be > 0 and <= 1")
+    if not runtime["payload_arm_targets"]:
+        raise ValueError("LLM runtime 'payload_arm_targets' must be non-empty")
+    if any(int(x) <= 0 for x in runtime["payload_arm_targets"]):
+        raise ValueError("LLM runtime 'payload_arm_targets' entries must be > 0")
+    if runtime["lane_max_in_flight_per_key"] < 1:
+        raise ValueError("LLM runtime 'lane_max_in_flight_per_key' must be >= 1")
+    if runtime["max_total_in_flight_requests"] < 1:
+        raise ValueError("LLM runtime 'max_total_in_flight_requests' must be >= 1")
+    if runtime["provider_group_cooldown_multiplier"] < 1:
+        raise ValueError("LLM runtime 'provider_group_cooldown_multiplier' must be >= 1")
+    if runtime["provider_group_throttle_threshold"] < 1:
+        raise ValueError("LLM runtime 'provider_group_throttle_threshold' must be >= 1")
 
     if runtime["target_tokens_per_minute"] is not None:
         if float(runtime["target_tokens_per_minute"]) <= 0:

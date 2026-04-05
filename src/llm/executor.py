@@ -31,11 +31,14 @@ from .runtime import (
 )
 from .state import (
     cleanup_llm_artifacts,
+    download_latest_json_if_exists,
     ensure_llm_state_layout,
+    upload_bandit_state,
     upload_versioned_json,
     upload_versioned_parquet,
     utc_now_run_id,
 )
+from .bandits.state import apply_state_decay
 from .work_units import build_manifest_df, build_work_units
 
 
@@ -460,6 +463,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
     validate_llm_step(step_config)
     source_df = data.collect(streaming=True) if isinstance(data, pl.LazyFrame) else data
     runtime = default_runtime(step_config)
+
     source_df = apply_input_row_window(source_df, runtime)
     run_id = utc_now_run_id()
 
@@ -487,6 +491,20 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         dest_connector=dest_connector,
         workflow_location=workflow_location,
     )
+
+    initial_bandit_state = None
+    if runtime.get("bandit_state_mode") == "cross_run":
+        initial_bandit_state = download_latest_json_if_exists(
+            dest_connector,
+            folders["state_folder"],
+            "bandit_state",
+            temp_dir,
+        )
+        initial_bandit_state = apply_state_decay(
+            initial_bandit_state,
+            decay=float(runtime.get("bandit_state_decay", 0.85) or 0.85),
+            ttl_hours=int(runtime.get("bandit_state_ttl_hours", 24) or 24),
+        )
 
     work_units_df = build_work_units(source_df, step_config)
     manifest_df = build_manifest_df(work_units_df)
@@ -651,6 +669,14 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         )
         metadata = build_runtime_metadata(step_config, work_units_df, progress_df, running_outcome, all_results_df=all_results_df)
         metadata["workflow_folder"] = pipeline_name
+        if payload.get("bandit_state"):
+            upload_bandit_state(
+                dest_connector,
+                folders["state_folder"],
+                payload["bandit_state"],
+                temp_dir,
+                run_id,
+            )
         print(f"[llm:{step_config['name']}] flush_canonical_start flush_count={flush_count}", flush=True)
         canonical_written = _flush_canonical_state(
             dest_connector,
@@ -729,6 +755,7 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
         progress_df=progress_df,
         start_time=start_time,
         flush_callback=flush_callback,
+        initial_bandit_state=initial_bandit_state,
     )
 
     _, partial_output_df, pair_status_df = _build_materialized_views(
@@ -749,6 +776,14 @@ def execute_llm_step(data, step_config: dict, runtime_context: dict):
 
     metadata = build_runtime_metadata(step_config, work_units_df, progress_df, batch_out["outcome"], all_results_df=all_results_df)
     metadata["workflow_folder"] = pipeline_name
+    if batch_out.get("bandit_state"):
+        upload_bandit_state(
+            dest_connector,
+            folders["state_folder"],
+            batch_out["bandit_state"],
+            temp_dir,
+            run_id,
+        )
 
     if change_generation > last_canonical_flushed_generation:
         print(f"[llm:{step_config['name']}] flush_canonical_start reason=run_end", flush=True)

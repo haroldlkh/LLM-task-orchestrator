@@ -20,6 +20,7 @@ ARTIFACT_FAMILIES = [
     "traces",
     "review",
     "results",
+    "bandit_state",
 ]
 
 
@@ -167,6 +168,32 @@ def upload_versioned_json(
     return filename
 
 
+def download_latest_json_if_exists(
+    connector,
+    location: str,
+    prefix: str,
+    temp_dir: str,
+) -> Optional[Dict]:
+    objects = connector.list_objects(location)
+    latest = latest_object_by_prefix(objects, prefix)
+    if latest is None:
+        return None
+    local_path = os.path.join(temp_dir, latest["name"])
+    connector.download_object(latest["id"], local_path)
+    with open(local_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def upload_bandit_state(
+    connector,
+    location: str,
+    payload: dict,
+    temp_dir: str,
+    run_id: str | None = None,
+) -> str:
+    return upload_versioned_json(connector, location, "bandit_state", payload, temp_dir, run_id=run_id)
+
+
 def _run_id_from_name(name: str) -> str | None:
     match = re.search(r"__run_(\d{8}_\d{6})__", name)
     if match:
@@ -197,6 +224,7 @@ def _family_keep_count(runtime: dict, prefix: str) -> int:
         "review": int(runtime.get("keep_last_reviews", default_keep)),
         "pair_status": int(runtime.get("keep_last_pair_status", default_keep)),
         "permanent_review": int(runtime.get("keep_last_permanent_reviews", default_keep)),
+        "bandit_state": int(runtime.get("keep_last_metadata", default_keep)),
     }
     return family_keep_counts.get(prefix, default_keep)
 
@@ -240,7 +268,7 @@ def _group_objects_by_run_id(objects: List[Dict], prefixes: List[str]) -> Dict[s
 
 def _prune_debug_runs(connector, folders: Dict[str, str], keep_last_runs: int) -> int:
     folder_prefixes = {
-        "state_folder": ["manifest", "progress", "metadata"],
+        "state_folder": ["manifest", "progress", "metadata", "bandit_state"],
         "results_folder": ["results", "partial_output"],
         "debug_folder": ["traces", "review", "pair_status", "permanent_review"],
     }
@@ -320,7 +348,7 @@ def cleanup_llm_artifacts(
 
     if mode == "standard":
         prune_plan = {
-            "state_folder": ["manifest", "progress", "metadata"],
+            "state_folder": ["manifest", "progress", "metadata", "bandit_state"],
             "results_folder": ["results", "partial_output", "results_snapshot", "results_checkpoint", "results_delta"],
             "debug_folder": ["traces", "review", "pair_status", "permanent_review"],
         }
